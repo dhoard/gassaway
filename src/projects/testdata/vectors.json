@@ -1,0 +1,34 @@
+[
+  {
+    "directory": "/work/customer-a/app",
+    "projectId": "7cb44a8caf3f8a377b2ca6b4c7a6cd20b30811d9a68faa7f264fb2ea1dc9c7c4"
+  },
+  {
+    "directory": "/work/customer-b/app",
+    "projectId": "b6af96db0d51fda82bab913b58c96d5fdff0564b62ba48b60c19ddaec1ff1a7e"
+  },
+  {
+    "directory": "/home/u/dev/My App",
+    "projectId": "7719c6b07599fcbaab29e455b776edec741844c928e61d696b63e078182eb5fc"
+  },
+  {
+    "directory": "/home/u/dev/my_app",
+    "projectId": "2b31ea18862ad93a7689aaf8fe9c865f32a40385409b5a9eaeefdc639213a010"
+  },
+  {
+    "directory": "/home/u/dev/my-app",
+    "projectId": "3a92ce4c4373ee321bcc0d60522a6d6927467d185d05eac880745ac6c018e21b"
+  },
+  {
+    "directory": "/home/u/dev/ünïcode",
+    "projectId": "858ee67a4bc43d2debe3115196c86a8097789d6ba792e5fb3a1f5f50025b9afb"
+  },
+  {
+    "directory": "/work/ spaces ",
+    "projectId": "be9cd9bcec4102be7fe43b4e298abdec0909b885459732d062b563849581a22e"
+  },
+  {
+    "directory": "/work/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/long-directory/app",
+    "projectId": "4bdd55ae5636512a78f5272728e877feba2646eaedbbed27877995b8f46ad238"
+  }
+]

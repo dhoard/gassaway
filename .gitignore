@@ -1,0 +1,18 @@
+# Build output: build.sh writes the static server binary here.
+bin/
+
+# Runtime project/graph data created by the server.
+data/
+
+# Vendored agent skills: third-party book text, not project source.
+.agents/
+
+# Go test binaries and coverage profiles left in the module root.
+*.test
+coverage.out
+
+# Local-only working notes: design and implementation plan artifacts.
+/plans/
+
+# Local developer run wrapper.
+/run.sh
