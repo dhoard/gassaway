@@ -55,6 +55,39 @@ type KnowledgeGraph struct {
 	Relations []Relation `json:"relations"`
 }
 
+// ReadEntity is an entity as a read operation returns it. ObservationCount is set
+// only when the read was given an observation limit, so a count above
+// len(Observations) tells the caller that observations were left out.
+type ReadEntity struct {
+	Name             string   `json:"name"`
+	EntityType       string   `json:"entityType"`
+	Observations     []string `json:"observations"`
+	ObservationCount *int     `json:"observationCount,omitempty"`
+}
+
+// RelationView is a relation as a read operation returns it; it is the stored
+// shape without the preserved extras, which never travel to a client.
+// ReadGraph is the result of one read: the entities selected, and every relation
+// that touches one of them.
+type ReadGraph struct {
+	Entities  []ReadEntity
+	Relations []Relation
+}
+
+// ReadOptions narrows and limits a read. The zero value returns everything.
+type ReadOptions struct {
+	// EntityTypes keeps only entities whose type is exactly one of these. Empty
+	// keeps every entity.
+	EntityTypes []string
+	// Limit caps how many entities are returned, in stored order. Zero returns
+	// every match.
+	Limit int
+	// ObservationLimit caps each returned entity's observations, keeping the
+	// first ones in the order they were added, and reports the total in
+	// ObservationCount. Nil returns every observation.
+	ObservationLimit *int
+}
+
 // CreateResult reports what a create_entities call added and what it skipped.
 type CreateResult struct {
 	Created []Entity
@@ -205,9 +238,13 @@ func encodeRelation(r Relation) ([]byte, error) {
 	})
 }
 
+// cloneEntity copies an entity so a caller cannot mutate the stored graph. The
+// copy's observations are always a non-nil slice: a tool result that says "null"
+// where its published schema says "array" is a contract violation, and an empty
+// observation list is a real, common state.
 func cloneEntity(e Entity) Entity {
 	c := e
-	c.Observations = append([]string(nil), e.Observations...)
+	c.Observations = append([]string{}, e.Observations...)
 	return c
 }
 
@@ -255,6 +292,45 @@ func matches(e Entity, lowerQuery string) bool {
 		}
 	}
 	return false
+}
+
+// limitEntityObservations applies an observation limit to a set of entities.
+func limitEntityObservations(entities []Entity, limit *int) []ReadEntity {
+	out := make([]ReadEntity, 0, len(entities))
+	for _, e := range entities {
+		observations := e.Observations
+		if observations == nil {
+			observations = []string{}
+		}
+		view := ReadEntity{Name: e.Name, EntityType: e.EntityType, Observations: observations}
+		if limit != nil {
+			total := len(observations)
+			if *limit >= 0 && *limit < total {
+				view.Observations = append([]string(nil), observations[:*limit]...)
+			}
+			view.ObservationCount = &total
+		}
+		out = append(out, view)
+	}
+	return out
+}
+
+// keepEntityTypes filters entities by type. An empty list keeps everything.
+func keepEntityTypes(entities []Entity, types []string) []Entity {
+	if len(types) == 0 {
+		return entities
+	}
+	want := make(map[string]bool, len(types))
+	for _, t := range types {
+		want[t] = true
+	}
+	out := make([]Entity, 0, len(entities))
+	for _, e := range entities {
+		if want[e.EntityType] {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // filterRelations keeps relations with at least one endpoint in names. The

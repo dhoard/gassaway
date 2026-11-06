@@ -12,13 +12,16 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
@@ -26,6 +29,7 @@ import (
 
 	"github.com/dhoard/gassaway/src/buildinfo"
 	"github.com/dhoard/gassaway/src/config"
+	"github.com/dhoard/gassaway/src/graph"
 	"github.com/dhoard/gassaway/src/server"
 )
 
@@ -85,10 +89,15 @@ func TestHealthReportsTheService(t *testing.T) {
 	assert.Equal(t, buildinfo.Version, payload["version"])
 	assert.Equal(t, float64(0), payload["projects"], "an untouched data directory stores nothing")
 
-	// Opening a project is visible in the count, which is the only operator view
-	// of the data directory the surface offers.
+	// A project that only reads leaves nothing on disk, so it is not counted; the
+	// count is the operator view of what the data directory actually holds.
 	cs := connect(t, ts.URL+"/project/"+idA)
 	callTool(t, cs, "read_graph", map[string]any{})
+	assert.Equal(t, float64(0), getJSON(t, ts.URL+"/healthz")["projects"], "a project with no stored data is not counted")
+
+	callTool(t, cs, "create_entities", map[string]any{
+		"entities": []map[string]any{{"name": "Ada", "entityType": "person", "observations": []string{}}},
+	})
 	assert.Equal(t, float64(1), getJSON(t, ts.URL+"/healthz")["projects"])
 }
 
@@ -113,10 +122,14 @@ func TestProjectRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// The ID is used unchanged and lands in the metadata exactly as supplied.
+// The ID is used unchanged and lands in the metadata exactly as supplied, at the
+// moment the project first holds something.
 func TestPathIDIsUsedUnchanged(t *testing.T) {
 	_, ts, cfg := newServer(t, 10)
-	callTool(t, connect(t, ts.URL+"/project/"+idA), "read_graph", map[string]any{})
+	cs := connect(t, ts.URL+"/project/"+idA)
+	callTool(t, cs, "create_entities", map[string]any{
+		"entities": []map[string]any{{"name": "Ada", "entityType": "person", "observations": []string{}}},
+	})
 
 	data, err := os.ReadFile(filepath.Join(cfg.ProjectsDir, idA, "project.json"))
 	require.NoError(t, err)
@@ -172,17 +185,64 @@ func TestBadIDInPathIsRefused(t *testing.T) {
 	assert.Contains(t, string(body), "invalid project ID")
 }
 
-func TestProjectCapIsEnforced(t *testing.T) {
-	_, ts, _ := newServer(t, 1)
-	first := post(t, ts.URL+"/project/"+idA, initialize)
-	first.Body.Close()
-	require.Equal(t, http.StatusOK, first.StatusCode)
+// The cap bounds how many project runtimes are held at once; reaching it drops
+// the least recently used runtime instead of refusing the new project. A dropped
+// runtime is rebuilt on demand, its data is untouched, and a session that still
+// holds the dropped server keeps working because the graph's write lock is shared
+// by path rather than owned by a Store.
+func TestProjectCapEvictsTheLeastRecentlyUsed(t *testing.T) {
+	logs := &bytes.Buffer{}
+	cfg := config.Config{
+		Host:         "127.0.0.1",
+		ProjectsDir:  t.TempDir(),
+		MaxProjects:  1,
+		MaxBodyBytes: 1 << 20,
+	}
+	svc := server.New(cfg, slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	ts := httptest.NewServer(svc.Handler())
+	t.Cleanup(ts.Close)
 
-	second := post(t, ts.URL+"/project/"+idB, initialize)
-	defer second.Body.Close()
-	assert.Equal(t, http.StatusTooManyRequests, second.StatusCode)
-	body, _ := io.ReadAll(second.Body)
-	assert.Contains(t, string(body), "GASSAWAY_MAX_PROJECTS")
+	write := func(id, name string) *mcp.ClientSession {
+		cs := connect(t, ts.URL+"/project/"+id)
+		callTool(t, cs, "create_entities", map[string]any{
+			"entities": []map[string]any{{"name": name, "entityType": "person", "observations": []string{}}},
+		})
+		return cs
+	}
+
+	sessionA := write(idA, "Ada")
+	write(idB, "Grace") // evicts A's runtime
+
+	assert.Contains(t, logs.String(), "evicted project runtime", "the cap drops a runtime rather than refusing a project")
+
+	// The session that holds the evicted runtime still reads and writes A's graph.
+	graph := callTool(t, sessionA, "read_graph", map[string]any{})
+	require.Len(t, graph["entities"], 1, "an evicted runtime keeps serving the session that holds it")
+	assert.Equal(t, "Ada", graph["entities"].([]any)[0].(map[string]any)["name"])
+
+	// A fresh session against A rebuilds the runtime from the file, and writes
+	// from the old and new runtime are serialized by the shared path lock.
+	sessionA2 := connect(t, ts.URL+"/project/"+idA)
+	var wg sync.WaitGroup
+	for _, w := range []struct {
+		cs   *mcp.ClientSession
+		name string
+	}{{sessionA, "Ada2"}, {sessionA2, "Ada3"}} {
+		wg.Add(1)
+		go func(cs *mcp.ClientSession, name string) {
+			defer wg.Done()
+			res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "create_entities",
+				Arguments: map[string]any{"entities": []map[string]any{{"name": name, "entityType": "person", "observations": []string{}}}},
+			})
+			assert.NoError(t, err)
+			assert.False(t, res.IsError)
+		}(w.cs, w.name)
+	}
+	wg.Wait()
+
+	final := callTool(t, sessionA2, "read_graph", map[string]any{})
+	assert.Len(t, final["entities"], 3, "no write may be lost between two runtimes over one graph")
 }
 
 func TestTraversalPathIsCleanedNotServed(t *testing.T) {
@@ -236,20 +296,23 @@ func post(t *testing.T, endpoint, body string) *http.Response {
 
 func TestMetadataSurvivesRestartAndRejectsCorruption(t *testing.T) {
 	root := t.TempDir()
-	registry := server.NewRegistry(root, 10)
-	_, err := registry.Get(idA)
+	registry := server.NewRegistry(root, 10, nil)
+	project, err := registry.Get(idA)
+	require.NoError(t, err)
+	// Reading creates nothing; the first write publishes the metadata.
+	_, err = project.Store.CreateEntities([]graph.Entity{{Name: "Ada", EntityType: "person"}})
 	require.NoError(t, err)
 	file := filepath.Join(root, idA, "project.json")
 	original, err := os.ReadFile(file)
 	require.NoError(t, err)
-	_, err = server.NewRegistry(root, 10).Get(idA)
+	_, err = server.NewRegistry(root, 10, nil).Get(idA)
 	require.NoError(t, err)
 	after, err := os.ReadFile(file)
 	require.NoError(t, err)
 	assert.Equal(t, original, after)
 	for _, bad := range []string{"{}", "not json", `{"schemaVersion":2,"projectId":"` + idA + `"}`, `{"schemaVersion":1,"projectId":"` + idB + `"}`} {
 		require.NoError(t, os.WriteFile(file, []byte(bad), 0o600))
-		_, err := server.NewRegistry(root, 10).Get(idA)
+		_, err := server.NewRegistry(root, 10, nil).Get(idA)
 		require.Error(t, err)
 		contents, err := os.ReadFile(file)
 		require.NoError(t, err)
@@ -263,8 +326,10 @@ func TestLegacyDirectoriesAreIgnored(t *testing.T) {
 	require.NoError(t, os.Mkdir(legacy, 0o755))
 	file := filepath.Join(legacy, "memory.jsonl")
 	require.NoError(t, os.WriteFile(file, []byte("old graph"), 0o600))
-	registry := server.NewRegistry(root, 10)
-	_, err := registry.Get(idA)
+	registry := server.NewRegistry(root, 10, nil)
+	project, err := registry.Get(idA)
+	require.NoError(t, err)
+	_, err = project.Store.CreateEntities([]graph.Entity{{Name: "Ada", EntityType: "person"}})
 	require.NoError(t, err)
 	count, err := registry.Count()
 	require.NoError(t, err)
@@ -272,4 +337,53 @@ func TestLegacyDirectoriesAreIgnored(t *testing.T) {
 	contents, err := os.ReadFile(file)
 	require.NoError(t, err)
 	assert.Equal(t, "old graph", string(contents))
+}
+
+// A connected Streamable HTTP client keeps a standalone SSE stream open, which
+// never goes idle. Shutdown must not report failure because of it: every
+// acknowledged write is durable, so draining and then closing is the contract.
+func TestShutdownSucceedsWithAConnectedClient(t *testing.T) {
+	cfg := config.Config{
+		Host:         "127.0.0.1",
+		ProjectsDir:  t.TempDir(),
+		MaxProjects:  10,
+		MaxBodyBytes: 1 << 20,
+	}
+	svc := server.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- svc.Serve(ln) }()
+	base := "http://" + ln.Addr().String()
+
+	// The default client transport: standalone SSE stays enabled, which is what a
+	// URL-only client such as a harness uses.
+	client := mcp.NewClient(&mcp.Implementation{Name: "shutdown-test", Version: "0"}, nil)
+	cs, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: base + "/project/" + idA}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cs.Close() })
+
+	callTool(t, cs, "create_entities", map[string]any{
+		"entities": []map[string]any{{"name": "Ada", "entityType": "person", "observations": []string{"durable"}}},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	require.NoError(t, svc.Shutdown(ctx), "shutdown must succeed once the grace period is spent")
+	elapsed := time.Since(start)
+	assert.Less(t, elapsed, 5*time.Second, "shutdown must not wait indefinitely")
+
+	select {
+	case err := <-serveErr:
+		assert.NoError(t, err, "Serve reports a clean stop")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after shutdown")
+	}
+
+	// The acknowledged write is on disk, so the next process sees it.
+	graph, err := os.ReadFile(filepath.Join(cfg.ProjectsDir, idA, "memory.jsonl"))
+	require.NoError(t, err)
+	assert.Contains(t, string(graph), "durable")
 }

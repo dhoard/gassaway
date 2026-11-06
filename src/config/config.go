@@ -20,6 +20,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -37,6 +38,7 @@ const (
 const (
 	EnvMaxProjects  = "GASSAWAY_MAX_PROJECTS"
 	EnvMaxBodyBytes = "GASSAWAY_MAX_BODY_BYTES"
+	EnvLogLevel     = "GASSAWAY_LOG_LEVEL"
 )
 
 // Accepted ports. 0 is refused even though the kernel would assign a free port:
@@ -61,6 +63,10 @@ type Options struct {
 	ProjectsDir string
 }
 
+// DefaultLogLevel is the level used when GASSAWAY_LOG_LEVEL is unset: failures are
+// visible, successes are not.
+const DefaultLogLevel = slog.LevelInfo
+
 // Config is the resolved server configuration.
 type Config struct {
 	// Host is the address the listener binds to.
@@ -73,6 +79,8 @@ type Config struct {
 	MaxProjects int
 	// MaxBodyBytes bounds a request body.
 	MaxBodyBytes int64
+	// LogLevel is the minimum level the server logs at.
+	LogLevel slog.Level
 }
 
 // Parse validates the required options and resolves the remaining settings.
@@ -105,6 +113,7 @@ func Parse(opts Options) (Config, error) {
 		ProjectsDir:  dir,
 		MaxProjects:  DefaultMaxProjects,
 		MaxBodyBytes: DefaultMaxBodyBytes,
+		LogLevel:     DefaultLogLevel,
 	}
 
 	if v := os.Getenv(EnvMaxProjects); v != "" {
@@ -114,6 +123,13 @@ func Parse(opts Options) (Config, error) {
 		}
 		cfg.MaxProjects = n
 	}
+	if v := os.Getenv(EnvLogLevel); v != "" {
+		level, err := ParseLogLevel(v)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.LogLevel = level
+	}
 	if v := os.Getenv(EnvMaxBodyBytes); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || n < 1 {
@@ -122,6 +138,23 @@ func Parse(opts Options) (Config, error) {
 		cfg.MaxBodyBytes = n
 	}
 	return cfg, nil
+}
+
+// ParseLogLevel turns a GASSAWAY_LOG_LEVEL value into a level. An unknown value
+// is refused rather than defaulted: a service that silently ignores the level it
+// was told to use is harder to diagnose than one that will not start.
+func ParseLogLevel(value string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	}
+	return 0, fmt.Errorf("%s must be one of debug, info, warn, error, got %q", EnvLogLevel, value)
 }
 
 // EnsureProjectDir creates the data directory, and any missing parent, when it does

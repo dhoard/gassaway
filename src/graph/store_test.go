@@ -7,8 +7,11 @@
 package graph_test
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -174,12 +177,12 @@ func TestSearchAndOpenIncludeTouchingRelations(t *testing.T) {
 	_, err = store.CreateRelations([]graph.Relation{{From: "Ada", To: "gassaway", RelationType: "works_on"}})
 	require.NoError(t, err)
 
-	found, err := store.SearchNodes("go")
+	found, err := store.SearchNodes("go", graph.ReadOptions{})
 	require.NoError(t, err)
 	assert.Len(t, found.Entities, 1)
 	assert.Len(t, found.Relations, 1, "a relation touching a match is included")
 
-	opened, err := store.OpenNodes([]string{"gassaway"})
+	opened, err := store.OpenNodes([]string{"gassaway"}, graph.ReadOptions{})
 	require.NoError(t, err)
 	require.Len(t, opened.Entities, 1)
 	assert.Len(t, opened.Relations, 1)
@@ -250,6 +253,82 @@ func TestSaveFailureLeavesThePreviousGraphIntact(t *testing.T) {
 	require.Error(t, err)
 
 	require.NoError(t, os.Chmod(dir, 0o700))
+	g, err := store.Read()
+	require.NoError(t, err)
+	require.Len(t, g.Entities, 1)
+	assert.Equal(t, "Ada", g.Entities[0].Name)
+}
+
+// Two Store values over one path must exclude each other: the server can drop a
+// project's runtime while a client session still holds the old one, and separate
+// mutexes would let their read-modify-write cycles interleave and lose updates.
+func TestTwoStoresOnOnePathSerialize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.jsonl")
+	stores := []*graph.Store{graph.NewStore(path), graph.NewStore(path)}
+
+	const each = 25
+	var wg sync.WaitGroup
+	errs := make([]error, len(stores))
+	for i, store := range stores {
+		wg.Add(1)
+		go func(i int, store *graph.Store) {
+			defer wg.Done()
+			for n := 0; n < each; n++ {
+				name := fmt.Sprintf("s%d-e%d", i, n)
+				if _, err := store.CreateEntities([]graph.Entity{{Name: name, EntityType: "t"}}); err != nil {
+					errs[i] = err
+					return
+				}
+			}
+		}(i, store)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		require.NoError(t, err, "store %d", i)
+	}
+
+	g, err := graph.NewStore(path).Read()
+	require.NoError(t, err)
+	assert.Len(t, g.Entities, len(stores)*each, "no write may be lost between two stores over one path")
+}
+
+// The prepare hook runs once, before the first save, and nothing exists on disk
+// until then: a read of a project that was never written leaves no directory.
+func TestPrepareRunsOnceBeforeTheFirstSave(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "project")
+	path := filepath.Join(dir, "memory.jsonl")
+	store := graph.NewStore(path)
+	created := 0
+	store.SetPrepare(func() error {
+		created++
+		return os.MkdirAll(dir, 0o755)
+	})
+
+	_, err := store.Read()
+	require.NoError(t, err)
+	_, statErr := os.Stat(dir)
+	assert.True(t, os.IsNotExist(statErr), "a read must not create the project directory")
+
+	_, err = store.CreateEntities([]graph.Entity{{Name: "Ada", EntityType: "person"}})
+	require.NoError(t, err)
+	assert.Equal(t, 1, created, "the prepare hook runs before the first save")
+
+	_, err = store.CreateEntities([]graph.Entity{{Name: "Grace", EntityType: "person"}})
+	require.NoError(t, err)
+	assert.Equal(t, 1, created, "the prepare hook runs only once")
+}
+
+// A prepare failure is a failed save, and the previous graph is untouched.
+func TestPrepareFailureFailsTheSave(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.jsonl")
+	store := graph.NewStore(path)
+	_, err := store.CreateEntities([]graph.Entity{{Name: "Ada", EntityType: "person"}})
+	require.NoError(t, err)
+
+	store.SetPrepare(func() error { return errors.New("no directory") })
+	_, err = store.CreateEntities([]graph.Entity{{Name: "Grace", EntityType: "person"}})
+	require.Error(t, err)
+
 	g, err := store.Read()
 	require.NoError(t, err)
 	require.Len(t, g.Entities, 1)

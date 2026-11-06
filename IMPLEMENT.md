@@ -1,194 +1,160 @@
-# Implementation Plan — <short outcome-focused title>
+# Implementation Plan — Tenant-safe sessions, crash containment, shutdown, a bounded project cache, and a pinned wire contract
 
-**Status:** Draft / Ready / In Progress / Implemented / Blocked / Superseded  
-**Request:** <issue, user request, or reference>  
-**Design:** <path to governing `.design.md`, or Not required — reason>  
-**Design decision:** Proposed / Accepted / Explicitly approved / Not required — <reason>  
-**Implementation authorization:** Planning only / <explicit user request authorizing execution>  
-**Scope:** <modules, components, files, integrations, documentation affected>  
-**Related:** <PR, issue, dependent changes, or none>
-
-> **Authoring instructions — delete this block from the finished plan.** Read applicable [AGENTS.md](AGENTS.md)
-> files, the root [PROJECT.md](PROJECT.md), the current project directory, relevant project contracts,
-> and the linked design. Resolve companion files from the intended project root, not a VCS root or
-> invocation directory. Missing configuration permits safe discovery, not guesses about commands or
-> permission. Save as `plans/<descriptive-kebab-case-name>.impl.md` unless `PROJECT.md` or the user
-> specifies otherwise. Use [DESIGN.md](DESIGN.md) for a separate design when needed. This document defines
-> **how to build, test, and verify** the specified behavior, then records **what actually happened**.
-> Do not re-decide design questions silently. A plan is not authorization to edit code. Replace all
-> placeholders with verified project-specific details before treating the plan as ready. Retain all
-> numbered sections, marking inapplicable sections with a reason. Distinguish planned commands
-> from actual results.
->
-> **Length and detail:** Aim for 1,500–2,000 words or fewer for the initial plan; small changes
-> should need less. This is a target, not a hard cap: exceed it only where needed to resolve
-> ambiguity or preserve a critical contract, and briefly explain the need. Keep all nine numbered
-> sections, concrete files and changes, regression coverage, exact verification commands, blockers,
-> and rollback considerations. Reference the governing design's R-xx and D-xx identifiers instead
-> of restating its requirements, decisions, and rationale. State each fact or planned command once,
-> then reference its section, step, or verification row elsewhere. Keep table cells concise and
-> avoid repeating their contents in surrounding prose. Expand implementation substeps only where
-> needed to make execution unambiguous. The execution record may grow as actual results accumulate;
-> retain the evidence needed for an accurate handoff.
+**Status:** Executed (see §9)
+**Request:** User instruction, 2026-11-06 — create and implement a plan to improve the project, using files for the plan
+**Design:** [DESIGN.md](DESIGN.md)
+**Implementation authorization:** Granted by the same instruction. Deployment is **not** authorized: the running unit, `/var/lib/gassaway` and port 4029 were not touched.
+**Constraints:** no authentication; no Origin validation; breaking changes allowed, so no backward compatibility, migration or adapter code; version stays `0.1.0`; no new module in `go.mod`; JSONL format, project identity and the two URLs unchanged.
+**Related:** `PROMPT_ENGINEER.md` (authoring standard), `README.md` (operator truth), `CHANGELOG.md` (what changed for a consumer)
 
 ## 1. Design contract and readiness
 
-**Design baseline:** <Link exact design document and any required approval/acceptance evidence. If no design document is
-needed for an explicitly authorized small fix, state the rationale and behavior being protected.>
+**Baseline:** `e1034ea` plus the uncommitted `DESIGN.md`/`IMPLEMENT.md` pair that this increment replaced. Tree otherwise clean; no commit was created (the user did not ask for one).
 
-**Implementation target:** <What has to be true after the change, in terms of the governing design.>
+**Target:** a panic cannot kill the process; a session cannot cross a project boundary; SIGTERM exits 0 with clients attached; a probe request creates nothing on disk; the project cap cannot wedge the service; every failed call leaves exactly one log record; the published tool contract is the reference's, pinned by a test.
 
-**Requirements / decisions to honor:** <List R-xx / D-xx from the design and applicable PROJECT.md
-instructions, constraints, and authoritative references; verify them against current evidence.>
-
-**Out of scope:** <No unrelated refactors or speculative changes.>
-
-**Preconditions / blockers:** <Toolchain, dependencies, permissions, decisions, baselines, or none.
-If behavior-defining design issues are unresolved, do not mark the plan Ready.>
+**Out of scope:** see DESIGN.md §9 "Deferred".
 
 ## 2. Verified starting state and change inventory
 
-Reinspect the current project directory before implementation. The design's source references may have aged. Git, CI, and even automated tests may be absent; record what verification mechanisms actually exist.
+Baseline before any edit: `go build ./...`, `go vet ./...`, `gofmt -l ./src` and `go test -race ./...` were green (DESIGN.md E-14). Toolchain: `go1.26.0 linux/amd64`; `staticcheck` not installed.
 
-| Evidence | Current location / command | Verified finding | Impact on plan |
-| --- | --- | --- | --- |
-| Code path / test / config / spec | <path and symbol or exact command> | <observed fact, not guess> | <step affected> |
-| Build / existing test baseline | <exact command, or not run> | <actual result / unknown> | <risk or dependency> |
-
-**Existing user changes and protected artifacts:** <What must be preserved, including pre-existing
-files/edits, generated paths, or external resources. Identify VCS if present; otherwise record a
-proportionate file inventory or content baseline.>
-
-**Affected change inventory:**
-
-| Component / path | Planned modification | Owning contract / requirement |
+| Component / path | Change | Requirement |
 | --- | --- | --- |
-| <concrete file/symbol; if new, exact proposed path> | <specific change> | R-01 / D-01 |
-| <test/fixture/doc path> | <coverage or document update> | R-02 |
+| `src/graph/store.go` | path-scoped write lock (`lockFor`), `SetPrepare` hook, `ReadGraph`/`SearchNodes`/`OpenNodes` take `ReadOptions` | R-09, R-10, R-04 |
+| `src/graph/graph.go` | `ReadEntity`, `ReadGraph`, `ReadOptions`, filtering and limiting helpers; `cloneEntity` returns a non-nil slice | R-04 |
+| `src/memory/schemas.go` (new) | nine argument schemas and nine result schemas, transcribed from the capture | R-04, R-05 |
+| `src/memory/testdata/reference-tools.json`, `PROVENANCE.md` (new) | committed capture of the reference `tools/list` + `resources/list` | R-04 |
+| `src/memory/tools.go` | authored schemas, titles, annotation hints, read options, `{success, message}` delete results, skipped-entity notice | R-04–R-06 |
+| `src/memory/resource.go` | title and description matching the reference | R-04 |
+| `src/memory/surface_test.go` (new) | contract test (both directions, inputs and results), acceptance corpus, read-option tests, delete-shape tests | R-04–R-06 |
+| `src/server/recovery.go` (new) | receiving middleware converting a panic into `-32603` | R-01 |
+| `src/server/logging.go` (new) | `tools/call` outcome middleware | R-07 |
+| `src/server/registry.go` | logger, `GetSessionID` prefix, LRU, lazy open, prepare hook, both middlewares | R-01, R-02, R-09, R-10 |
+| `src/server/router.go` | session-prefix check, edge logging, generic 5xx bodies, drain-then-close shutdown | R-02, R-03, R-07 |
+| `src/server/recovery_test.go`, `isolation_test.go`, `logging_test.go` (new) | R-01, R-02, R-07 | — |
+| `src/server/router_test.go` | updated for lazy creation, LRU, metadata timing, shutdown | R-03, R-09, R-10 |
+| `src/config/config.go` | `ParseLogLevel`, `EnvLogLevel`, `Config.LogLevel` | R-08 |
+| `src/e2e/e2e_test.go` | SIGTERM-with-client case, failed-call log assertion, junk log level, isolation storage assertions | R-03, R-07, R-08 |
+| `src/projects/fuzz_test.go` (new) | fuzz `Validate` and `ID` | R-11 |
+| `README.md`, `CHANGELOG.md` (new) | surface, configuration, logging, compatibility, security posture | R-12 |
+| `src/buildinfo/version.go` | **not changed** — version stays `0.1.0` (user instruction) | R-13 |
 
-Do not invent a source file, tool, test framework, or command before inspecting the project.
+## 3. Executed steps
 
-## 3. Ordered implementation steps
-
-Each step has a bounded deliverable, its prerequisite, a regression or verification check,
-and a completion condition. Implement from the lowest appropriate boundary outward.
-
-| Step | Prerequisites | Concrete change | Coverage / evidence | Done when |
-| --- | --- | --- | --- | --- |
-| I-01 | <baseline> | <test/fixture proving R-01> | <specific test path or check> | <fails for the confirmed old defect, or pins the new contract> |
-| I-02 | I-01 | <implementation paths and symbols> | <focused test> | <new behavior passes and invariants hold> |
-| I-03 | I-02 | <consumers, docs, migration/packaging as needed> | <integration/compatibility check> | <all touched boundaries agree> |
-
-For substantial work, expand the table into explicit substeps with dependency order, rollback
-considerations, expected artifacts, and handoff points. Avoid vague steps such as “implement the
-feature” or “add tests.” Keep optional improvements out of the required critical path.
+| Step | Change | Result |
+| --- | --- | --- |
+| I-01 | `graph`: path-scoped lock + prepare hook + tests | Two stores over one path: 25 of 50 writes were lost with independent mutexes (verified by temporarily reverting `lockFor`), none lost with the shared lock |
+| I-02 | `memory`: capture, schema literals, titles, annotations, result shapes, read options, skipped notice | Contract test fails on a closed object or a renamed property (verified by temporarily editing `schemas.go`) |
+| I-03 | `server`: panic recovery | Without the middleware the test binary dies with `panic: assignment to entry in nil map`; with it, the call returns an error and the next call succeeds |
+| I-04 | `server`: session-ID prefix + edge check | Cross-project POST/GET/DELETE ⇒ 404, nothing created; a forged suffix ⇒ 404 |
+| I-05 | `server`: shutdown drain + forced close | `Shutdown` returns nil in ~250 ms with an SSE client (grace-exhausted close), `Serve` returns nil, the acknowledged write is on disk |
+| I-06 | `server` + `config`: logging, log level, generic 5xx | One `Warn` per failed call (including argument-validation failures), none for a success, sentinel observation absent at `debug` and `info` |
+| I-07 | `server`: lazy resolution + LRU | A read of an unknown project leaves the root empty; one project's `project.json` appears on first write; a cap of 1 serves two projects with eviction, and the evicted runtime's session keeps working |
+| I-08 | `projects`: fuzz targets | `FuzzValidate` 1.83 M execs / 9 s, `FuzzID` 338 k execs / 6 s, both clean |
+| I-09 | Docs: README, CHANGELOG, DESIGN, IMPLEMENT | Version left at `0.1.0` |
+| I-10 | Full gate | See §9 |
 
 ## 4. Requirements-to-changes traceability
 
-Every **required** design criterion must have an implementation owner and a way to verify it.
+| Requirement | Steps | Verification |
+| --- | --- | --- |
+| R-01 | I-03 | `TestPanicInToolHandlerIsContained`, `TestPanicInResourceHandlerIsContained`, `TestRecoveredPanicIsNotDisclosed` |
+| R-02 | I-04 | `TestForeignSessionIsRefusedForEveryMethod`, `TestSessionsAreScopedToTheirProject` |
+| R-03 | I-05 | `TestShutdownSucceedsWithAConnectedClient`, `TestSigtermExitsCleanlyWithAConnectedClient` |
+| R-04, R-05, R-06 | I-02 | `TestInputSchemasAreTheReferenceContract`, `TestToolMetadataMatchesTheReference`, `TestResourceMatchesTheReference`, `TestAcceptedPayloads`, `TestReadToolOptions`, `TestDeleteToolsReportLikeTheReference`, `TestSkippedNoticeNamesTheEntities` |
+| R-07, R-08 | I-06 | `TestFailedToolCallIsOneWarnRecord`, `TestInvalidArgumentsAreLogged`, `TestSuccessfulCallsAreNotWarned`, `TestLogsCarryNoGraphContent`, `TestEdgeRefusalsAreLogged`, `TestServerErrorBodyIsGeneric`, `TestFailedCallIsVisibleInTheServersLog`, `TestJunkLogLevelIsRefused` |
+| R-09, R-10 | I-01, I-07 | `TestUnknownProjectIsNotCreatedByReading`, `TestHealthCountsStoredProjects`, `TestProjectCapEvictsTheLeastRecentlyUsed`, `TestTwoStoresOnOnePathSerialize`, `TestPrepareRunsOnceBeforeTheFirstSave` |
+| R-11 | I-04, I-07, I-08 | `TestProjectCannotReachAnotherProjectsData`, `FuzzValidate`, `FuzzID` |
+| R-12 | I-09 | `README.md` "Security posture" |
+| R-13 | all | The pre-existing suites pass; version unchanged |
 
-| Requirement / decision | Step(s) | Files / components | Verification evidence planned |
-| --- | --- | --- | --- |
-| R-01 / D-01 | I-01, I-02 | <concrete paths> | <test / probe / inspection> |
-| R-02 | I-03 | <concrete paths> | <regression / compatibility check> |
+## 5. Regression and edge-case matrix (as verified)
 
-Explicitly state **Not applicable — <reason>** for any common concern that is materially irrelevant
-(e.g., migration, public API, concurrency, release packaging). Do not omit a required design
-criterion merely because it is hard to test.
+| Scenario | Outcome | Test |
+| --- | --- | --- |
+| Panic in a tool | `-32603`, process alive | `recovery_test.go` |
+| Panic in a resource | `-32603`, process alive | `recovery_test.go` |
+| Panic value quoted from graph content | Not disclosed | `TestRecoveredPanicIsNotDisclosed` |
+| Foreign session, POST/GET/DELETE | 404, nothing created | `isolation_test.go` |
+| Forged session suffix | 404 | `TestSessionsAreScopedToTheirProject` |
+| SIGTERM with SSE client | exit 0, write durable | `e2e` `TestSigtermExitsCleanlyWithAConnectedClient` |
+| Read of an unknown project | empty graph, root untouched | `TestUnknownProjectIsNotCreatedByReading` |
+| First write | directory + metadata + graph | `TestPathIDIsUsedUnchanged`, `TestPrepareRunsOnceBeforeTheFirstSave` |
+| Corrupt metadata | open fails, generic 500, detail logged | `TestServerErrorBodyIsGeneric`, `TestMetadataSurvivesRestartAndRejectsCorruption` |
+| Cap of 1, two projects | both serve, eviction logged | `TestProjectCapEvictsTheLeastRecentlyUsed` |
+| Evicted runtime's session | keeps working, writes serialized | same |
+| Unknown envelope field | accepted | `TestAcceptedPayloads` |
+| Flattened payload | required-property error | `TestAcceptedPayloads` |
+| `observationLimit: 0`, `limit`, `entityTypes` | honoured; `observationCount` only when limited | `TestReadToolOptions` |
+| Failed call | one record, sentinel absent | `logging_test.go` |
+| Junk log level | exit 2 | `TestJunkLogLevelIsRefused` |
 
-## 5. Regression and edge-case matrix
+## 6. Verification commands (executed)
 
-Add deterministic positive and negative checks for relevant boundaries. Record the required
-absence of side effects, not just the expected success output.
+| Order | Command | Result |
+| --- | --- | --- |
+| 1 | `go test ./src/graph ./src/memory ./src/config ./src/projects` | ok |
+| 2 | `go test ./src/server` | ok |
+| 3 | `go test ./src/e2e` | ok (~6 s, of which 5 s is the shutdown grace with a live SSE client) |
+| 4 | `gofmt -l ./src` | empty |
+| 5 | `go vet ./...` | clean |
+| 6 | `go test -race ./...` | ok (see §9) |
+| 7 | `CGO_ENABLED=0 go build -trimpath -o /tmp/gassaway-gate ./src/cmd/gassaway` | built, 12.8 MB |
+| 8 | `git diff --check` | clean |
+| 9 | `go test ./src/projects -run XXX -fuzz FuzzValidate -fuzztime 8s` | 1.83 M execs, clean |
+| 10 | `go test ./src/projects -run XXX -fuzz FuzzID -fuzztime 5s` | 338 k execs, clean |
 
-| Scenario | Expected outcome / prohibited behavior | Test or verification boundary | Covers |
-| --- | --- | --- | --- |
-| Normal behavior | <required result> | <test path and case> | R-01 |
-| Invalid, empty, or boundary input | <safe rejection / exact behavior> | <test path and case> | R-01 |
-| Failure, interruption, cancellation | <safe rollback/recovery; no partially applied state> | <test/controlled probe> | R-01 |
-| Retry, parallelism, or repeated action | <idempotency/ordering; no duplicate effect> | <test/controlled probe> | R-02 |
-| Existing consumer / version / migration | <compatibility preserved or intentional break> | <integration/contract test> | R-02 |
-
-Use owned temporary state, hermetic fixtures where practical, and explicit event coordination
-rather than timing-dependent sleeps. Real network/services, credentials, and destructive test state
-need clear justification and explicit authorization.
-
-## 6. Planned verification commands (not execution results)
-
-Use **only verified commands from PROJECT.md and the project's scripts, CI (if any), or documented
-tooling**. Resolve stale or conflicting configuration before dependent checks. Replace
-all placeholders with actual commands and target names. State prerequisites, working directory,
-and side effects. If a verification gate cannot be run here, mark it as planned-but-unavailable.
-
-| Order | Exact command or manual procedure | Purpose / acceptance gate | Prerequisite |
-| --- | --- | --- | --- |
-| 1 | `<focused test command>` | <specific regression> | <toolchain> |
-| 2 | `<integration / contract test command>` | <cross-boundary behavior> | <build artifacts> |
-| 3 | `<project-defined full verification command>` | <required project gate> | <environment> |
-| 4 | `<diff / static check command>` | <review / formatting / lint> | <tool> |
-
-**Behavior probes:** <Exact executable invocation and expected observable output when automated
-tests do not fully cover user-visible behavior. Do not run against real user state.>
-
-**Pass criteria:** <Required gates and their expected observations, consistent with the design.>
+`build.sh` was deliberately not run: it writes `bin/gassaway`, and the deployed service is running. Its steps were run individually, with the static build going to `/tmp`.
 
 ## 7. Execution safety, integration, and rollback
 
-**Change safeguards:** <User edits and files to preserve, optional VCS or non-VCS baseline, owned test directories, generated output rules,
-external effects to avoid, secrets handling, and whether parallel edits may race.>
+- No test touched `/var/lib/gassaway`, port 4029 or the running unit; every test uses `t.TempDir()` and an ephemeral port.
+- No `install.sh`, no systemd, no restart; `bin/gassaway` was not overwritten.
+- Rollback: revert the source. No stored state changed shape, so no data rollback exists or is needed.
+- No new module: schemas are JSON literals, the middlewares use the pinned SDK, the Origin question was closed by decision.
 
-**Integration and release considerations:** <Dependency ordering, deployment, migration,
-compatibility, documentation, and other affected consumers; or not applicable with reason.>
+## 8. Risks encountered
 
-**Rollback / recovery:** <How to undo the code change and, if relevant, safely handle migrated
-persistent state or artifacts. A source revert may not reverse a data-format change.>
-
-**Scope control:** <How material design deviations will be escalated and recorded. Do not add
-unrelated refactors or silently redefine the governing behavior.>
-
-## 8. Risks and decisions needed during execution
-
-| Risk / unknown | Consequence | Proposed mitigation / evidence needed | Blocking? |
-| --- | --- | --- | --- |
-| <risk> | <impact> | <mitigation and verification> | Yes / No |
-
-For a new behavior-defining question, amend the governing design and obtain a decision when required by the project workflow or the authorized scope. A technical
-obstacle or a failing gate belongs here until resolved; it does not count as acceptance.
+| Risk | Outcome |
+| --- | --- |
+| Provided `InputSchema` rejected by the SDK's resolver | Accepted; `map[string]any` literals resolve, and the typed handlers still validate and decode |
+| Authored result schemas reject the handler's own output | Happened once: `cloneEntity` turned an empty observation slice into `null`, which the result schema rejects. Fixed at the source (`cloneEntity` and `entityView` now always produce a non-nil slice) — the schema caught a real contract bug |
+| `calledTool` type assertion missed the tool name | Happened: the receive side hands middleware `*mcp.CallToolParamsRaw`. Both types are now handled |
+| Existing tests encoded the old behaviour | Updated where DESIGN.md §6 states the change: cap (429 → eviction), `project.json` timing, `delete_*` result shapes, `/healthz` count |
+| A 5 s shutdown grace slows e2e | Accepted: it is the documented drain window |
 
 ## 9. Execution record and handoff
 
-> **Fill this section with observed facts only when implementation is authorized and executed.**
-> Leave it clearly marked “Not executed — plan only” otherwise. Never substitute expected results
-> for actual command output.
-
-**Execution status:** Not executed — plan only / In progress / Implemented / Blocked  
-**Implementation authorization evidence:** <request authorizing code changes; or planning only>  
-**Change tracking:** <VCS and revision(s) if available, or non-VCS paths/baseline; commits only if explicitly requested>  
-**Implemented changes:** <Actual files and behavior changed; or none>  
-**Deviations from plan/design:** <Actual deviations, approval reference, or none>  
-**Documentation / migrations / generated artifacts:** <Actual updates or not applicable>
+**Execution status:** Complete; verified locally; not deployed.
+**Implementation authorization evidence:** User instruction 2026-11-06 ("use files to create and implement a plan to improve the project based on the previously provided recommendations"), with later constraints: no authentication, no Origin validation, breaking changes allowed, version stays `0.1.0`, running service untouched.
+**Change tracking:** No commit created (not requested). Working tree carries the changes; `git status --short` lists exactly the paths in §2.
+**Deferred:** see DESIGN.md §9 and `CHANGELOG.md` "Deferred".
 
 ### Commands actually run and observed results
 
-| Exact command / check | Actual result | Evidence / failure details |
-| --- | --- | --- |
-| <only commands actually executed> | Passed / Failed / Blocked | <observed result, logs, artifact path> |
-
-**Not run:** <List required or planned checks not performed and why.>  
-**Baseline failures:** <Pre-existing issues distinguished from newly introduced failures.>  
-**Remaining work:** <Unmet requirements, blockers, deferred work, and risk owner.>
+| Command | Actual result |
+| --- | --- |
+| `go build ./...` (baseline and after each step) | clean |
+| `go vet ./...` | clean |
+| `gofmt -l ./src` | empty |
+| `go test ./...` (baseline) | all packages ok |
+| `go test -race ./...` (final) | `config 1.0 s`, `e2e 6.6 s`, `graph 1.1 s`, `memory 1.3 s`, `projects 1.0 s`, `server 1.9 s` — all ok |
+| `CGO_ENABLED=0 go build -trimpath -o /tmp/gassaway-gate ./src/cmd/gassaway` | built, 12 751 265 bytes |
+| `git diff --check` | clean |
+| `go test ./src/projects -run XXX -fuzz FuzzValidate -fuzztime 8s` | 1 834 047 execs, PASS |
+| `go test ./src/projects -run XXX -fuzz FuzzID -fuzztime 5s` | 338 320 execs, PASS |
+| Mutation check: revert `graph.lockFor` to a per-store mutex | `TestTwoStoresOnOnePathSerialize` fails with 25 of 50 entities present |
+| Mutation check: disable the recovery middleware | `TestPanicInToolHandlerIsContained` dies with `panic: assignment to entry in nil map` |
+| Mutation check: close an argument object in `schemas.go` | `TestInputSchemasAreTheReferenceContract` fails on openness |
+| `/tmp` probe copy of the tree (pre-change) | reproduced E-01, E-03, E-04, E-06; captured the reference `tools/list` |
 
 ### Final acceptance checklist
 
-- [ ] Required R-xx criteria are implemented and supported by tests or other concrete evidence.
-- [ ] Relevant negative cases and preserved contracts have regression coverage.
-- [ ] Affected consumers, docs, schemas, fixtures, and release artifacts have been updated as needed.
-- [ ] Focused tests and applicable full project gates passed, or gaps are explicitly recorded above.
-- [ ] Implementation contains no introduced stubs, temporary debug code, misleading success paths,
-      or unrelated changes.
-- [ ] Changes reviewed against the recorded baseline (VCS diff/status if available, otherwise file inspection/inventory); user edits and external state preserved.
-- [ ] No material deviation from governing design lacks a recorded decision.
-- [ ] All known unverified behavior, skipped gates, and limitations have been disclosed.
-
-**Final assessment:** <Complete with evidence / Partial / Blocked, with specific explanation.
-Never express an unverifiable “100% confidence” as a substitute for evidence.>
+- [x] R-01–R-13 implemented, each with the test named in §4.
+- [x] Negative cases covered: foreign session, forged suffix, panic disclosure, closed argument object, unknown field, flattened payload, corrupt metadata, cap exhaustion, junk log level.
+- [x] Consumers updated: `README.md`, `CHANGELOG.md`, and the tool contract pinned to the capture.
+- [x] Gates passed: `gofmt`, `go vet`, `go test -race ./...`, static build. `staticcheck` unavailable on this host.
+- [x] No stubs, no debug code, no unrelated changes; version unchanged.
+- [x] Diff reviewed against the §2 inventory; no user edits or external state were touched.
+- [x] Unverified items disclosed: `staticcheck` not run; `build.sh` not run as-is (equivalent steps executed); deployment not attempted.

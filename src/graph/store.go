@@ -33,13 +33,75 @@ import (
 // cycle; reads alone do not take it, because the file is replaced atomically.
 type Store struct {
 	path string
-	mu   sync.Mutex
+
+	// mu is shared by every Store over the same path in this process (see
+	// lockFor). The server may drop and later recreate a project's runtime — for
+	// example when an LRU cache evicts it while a client session still holds the
+	// old one — and two Stores with independent mutexes would let two
+	// read-modify-write cycles interleave and lose an update. Keying the lock by
+	// path makes that impossible regardless of how many Store values exist.
+	mu *sync.Mutex
+
+	// prepare, when set, runs once before the first save. The owner of the file
+	// uses it to create the project directory and its metadata at the moment
+	// there is something to store, so a request that only reads a project leaves
+	// no trace on disk. It runs under mu.
+	prepare  func() error
+	prepared bool
 }
 
-// NewStore returns a store over the JSONL file at path. The directory is not
-// created here: the owner of the project (the server registry) does that.
+// NewStore returns a store over the JSONL file at path. Nothing is created here:
+// the directory is made by the first save, either directly or through the
+// prepare hook.
 func NewStore(path string) *Store {
-	return &Store{path: path}
+	return &Store{path: path, mu: lockFor(path)}
+}
+
+// SetPrepare registers fn to run once, before this store's first save. A nil fn
+// restores the default behaviour of creating the directory with MkdirAll. It is
+// called by the owner of the project while the store is still private to it, so
+// it is not safe to call concurrently with a save.
+func (s *Store) SetPrepare(fn func() error) { s.prepare = fn }
+
+// pathLocks remembers one mutex per graph path for the lifetime of the process.
+// The table grows with the number of distinct paths this process has seen, which
+// is bounded by the number of distinct project IDs it has been asked about; each
+// entry is a path string and a pointer.
+var (
+	pathLocksMu sync.Mutex
+	pathLocks   = make(map[string]*sync.Mutex)
+)
+
+// lockFor returns the mutex shared by every Store over path.
+func lockFor(path string) *sync.Mutex {
+	key := path
+	if abs, err := filepath.Abs(path); err == nil {
+		key = abs
+	}
+	pathLocksMu.Lock()
+	defer pathLocksMu.Unlock()
+	mu, ok := pathLocks[key]
+	if !ok {
+		mu = new(sync.Mutex)
+		pathLocks[key] = mu
+	}
+	return mu
+}
+
+// ensureDir makes the graph's directory exist, running the prepare hook at most
+// once. It is called with mu held.
+func (s *Store) ensureDir() error {
+	if s.prepare == nil {
+		return os.MkdirAll(filepath.Dir(s.path), 0o755)
+	}
+	if s.prepared {
+		return nil
+	}
+	if err := s.prepare(); err != nil {
+		return err
+	}
+	s.prepared = true
+	return nil
 }
 
 // snapshot is one reading of the file: the graph it holds and the lines the model
@@ -109,7 +171,7 @@ func (s *Store) save(l snapshot) error {
 	}
 	lines = append(lines, l.unreadable...)
 
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+	if err := s.ensureDir(); err != nil {
 		return err
 	}
 
@@ -218,6 +280,32 @@ func (s *Store) Read() (KnowledgeGraph, error) {
 		return KnowledgeGraph{}, err
 	}
 	return l.graph, nil
+}
+
+// graphFrom selects the part of a loaded graph a read asked for: the entities
+// the filter kept, capped by the options, with the relations that touch them.
+func graphFrom(g KnowledgeGraph, entities []Entity, opts ReadOptions) ReadGraph {
+	if opts.Limit > 0 && len(entities) > opts.Limit {
+		entities = entities[:opts.Limit]
+	}
+	names := make(map[string]bool, len(entities))
+	for _, e := range entities {
+		names[e.Name] = true
+	}
+	return ReadGraph{
+		Entities:  limitEntityObservations(entities, opts.ObservationLimit),
+		Relations: filterRelations(g, names),
+	}
+}
+
+// ReadGraph returns the whole graph, optionally filtered by entity type and
+// capped by opts.
+func (s *Store) ReadGraph(opts ReadOptions) (ReadGraph, error) {
+	g, err := s.Read()
+	if err != nil {
+		return ReadGraph{}, err
+	}
+	return graphFrom(g, keepEntityTypes(g.Entities, opts.EntityTypes), opts), nil
 }
 
 // CreateEntities adds entities whose names are new, skipping names that already
@@ -402,41 +490,39 @@ func (s *Store) DeleteRelations(relations []Relation) (int, error) {
 	return deleted, nil
 }
 
-// SearchNodes returns entities matching query and every relation touching them.
-func (s *Store) SearchNodes(query string) (KnowledgeGraph, error) {
+// SearchNodes returns entities matching query, capped by opts, and every relation
+// that touches one of them.
+func (s *Store) SearchNodes(query string, opts ReadOptions) (ReadGraph, error) {
 	g, err := s.Read()
 	if err != nil {
-		return KnowledgeGraph{}, err
+		return ReadGraph{}, err
 	}
-	names := make(map[string]bool)
-	out := KnowledgeGraph{Entities: []Entity{}, Relations: []Relation{}}
 	lowerQuery := strings.ToLower(query)
+	matched := make([]Entity, 0, len(g.Entities))
 	for _, e := range g.Entities {
 		if matches(e, lowerQuery) {
-			out.Entities = append(out.Entities, cloneEntity(e))
-			names[e.Name] = true
+			matched = append(matched, e)
 		}
 	}
-	out.Relations = filterRelations(g, names)
-	return out, nil
+	return graphFrom(g, matched, opts), nil
 }
 
-// OpenNodes returns the named entities and every relation touching them.
-func (s *Store) OpenNodes(names []string) (KnowledgeGraph, error) {
+// OpenNodes returns the named entities, capped by opts, and every relation that
+// touches one of them.
+func (s *Store) OpenNodes(names []string, opts ReadOptions) (ReadGraph, error) {
 	g, err := s.Read()
 	if err != nil {
-		return KnowledgeGraph{}, err
+		return ReadGraph{}, err
 	}
 	want := make(map[string]bool, len(names))
 	for _, n := range names {
 		want[n] = true
 	}
-	out := KnowledgeGraph{Entities: []Entity{}, Relations: []Relation{}}
+	matched := make([]Entity, 0, len(names))
 	for _, e := range g.Entities {
 		if want[e.Name] {
-			out.Entities = append(out.Entities, cloneEntity(e))
+			matched = append(matched, e)
 		}
 	}
-	out.Relations = filterRelations(g, want)
-	return out, nil
+	return graphFrom(g, matched, opts), nil
 }

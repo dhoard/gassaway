@@ -29,7 +29,8 @@ func RegisterResource(s *mcp.Server, store *graph.Store) {
 	s.AddResource(&mcp.Resource{
 		URI:         ResourceURI,
 		Name:        "knowledge-graph",
-		Description: "This project's whole graph, in the same shape read_graph returns",
+		Title:       "Knowledge Graph",
+		Description: "The full knowledge graph with all entities and relations",
 		MIMEType:    "application/json",
 	}, func(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 		g, err := store.Read()

@@ -122,7 +122,7 @@ func serve(cfg config.Config) int {
 		return 1
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	srv := server.New(cfg, logger)
 
 	ln, err := net.Listen("tcp", cfg.Addr())

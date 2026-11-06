@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -32,6 +33,10 @@ import (
 // ProjectPath is the one path that addresses a project. Its {id} segment must be
 // exactly 64 lowercase hexadecimal characters.
 const ProjectPath = "/project/{id}"
+
+// sessionHeader is the header the Streamable HTTP transport uses to resume a
+// session.
+const sessionHeader = "Mcp-Session-Id"
 
 type contextKey struct{}
 
@@ -49,7 +54,7 @@ func New(cfg config.Config, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{cfg: cfg, registry: NewRegistry(cfg.ProjectsDir, cfg.MaxProjects), log: log}
+	s := &Server{cfg: cfg, registry: NewRegistry(cfg.ProjectsDir, cfg.MaxProjects, log), log: log}
 
 	streamable := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
 		p, ok := projectFrom(r.Context())
@@ -93,32 +98,63 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 // Shutdown stops the listener and waits for in-flight requests, bounded by ctx.
+//
+// A Streamable HTTP client keeps a standalone SSE stream open for as long as it
+// is connected, and that stream never goes idle, so the graceful wait cannot
+// finish while one exists. Once the wait is exhausted the remaining connections
+// are closed: the SDK exposes no way to close sessions (its closeAll is test
+// only), and every acknowledged write is already durable — a tool call returns
+// only after PublishFile has renamed and synced the graph — so a closed
+// connection cannot lose data the client was told was stored. A drained-then-
+// forced shutdown is a success; the reason is logged for the operator.
 func (s *Server) Shutdown(ctx context.Context) error {
-	return s.httpServer.Shutdown(ctx)
+	err := s.httpServer.Shutdown(ctx)
+	if err == nil {
+		return nil
+	}
+	if closeErr := s.httpServer.Close(); closeErr != nil {
+		return errors.Join(err, closeErr)
+	}
+	s.log.Warn("shutdown: closed connections that did not drain", "reason", err)
+	return nil
 }
 
 // withProject resolves the path's project, stores it in the context, and only
 // then delegates. Resolving here rather than in getServer means the failure modes
-// (bad name, cap, unwritable directory) become ordinary HTTP errors with a
-// message, instead of the SDK's bare 400.
+// (bad identity, foreign session, unreadable project metadata) become ordinary
+// HTTP errors with a message, instead of the SDK's bare 400.
 func (s *Server) withProject(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, err := resolveID(r)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			s.refuse(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+		// A session is only usable at the project that minted it. The check is
+		// made before the project is opened or created, so a foreign session
+		// cannot reach another graph, cannot make this server build a runtime for
+		// a project nobody asked for, and cannot leave a directory behind. 404 is
+		// the status the protocol assigns to a session the server no longer has.
+		if sessionID := r.Header.Get(sessionHeader); sessionID != "" && !sessionBelongsTo(sessionID, id) {
+			s.refuse(w, r, http.StatusNotFound, "session not found")
 			return
 		}
 		p, err := s.registry.Get(id)
 		if err != nil {
-			status := http.StatusInternalServerError
-			if errors.Is(err, ErrTooManyProjects) {
-				status = http.StatusTooManyRequests
-			}
-			writeError(w, status, err.Error())
+			s.refuse(w, r, http.StatusInternalServerError, err.Error())
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), contextKey{}, p)))
 	})
+}
+
+// sessionBelongsTo reports whether sessionID was minted by the server of project
+// id. Session IDs are "<projectID>.<crypto/rand.Text()>", so the prefix is the
+// project's; the suffix is what the SDK's session table matches, which is why a
+// guessable prefix is not enough to use someone else's session.
+func sessionBelongsTo(sessionID, id string) bool {
+	rest, ok := strings.CutPrefix(sessionID, id+".")
+	return ok && rest != ""
 }
 
 func projectFrom(ctx context.Context) (*Project, bool) {
@@ -136,10 +172,24 @@ func resolveID(r *http.Request) (string, error) {
 	return id, nil
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+// refuse answers a request the server will not serve and records why. A client
+// error is quoted back — the message is actionable and names no storage path —
+// while a server error is logged in full and answered generically, so a path or
+// an internal detail does not travel to the caller.
+func (s *Server) refuse(w http.ResponseWriter, r *http.Request, status int, reason string) {
+	if status >= http.StatusInternalServerError {
+		s.log.Error("request failed", "method", r.Method, "path", r.URL.Path, "status", status, "error", reason)
+		writeError(w, status, "project storage is not available")
+		return
+	}
+	s.log.Warn("request refused", "method", r.Method, "path", r.URL.Path, "status", status, "reason", reason)
+	writeError(w, status, reason)
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	count, err := s.registry.Count()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.refuse(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -150,7 +200,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotFound, fmt.Sprintf("no route for %s %s: use /project/<id> or /healthz", r.Method, r.URL.Path))
+	s.refuse(w, r, http.StatusNotFound, fmt.Sprintf("no route for %s %s: use /project/<id> or /healthz", r.Method, r.URL.Path))
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

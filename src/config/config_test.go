@@ -8,6 +8,7 @@
 package config_test
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -26,7 +27,7 @@ func valid() config.Options {
 // clearLimitEnv removes any limit the developer's shell may export.
 func clearLimitEnv(t *testing.T) {
 	t.Helper()
-	for _, name := range []string{config.EnvMaxProjects, config.EnvMaxBodyBytes} {
+	for _, name := range []string{config.EnvMaxProjects, config.EnvMaxBodyBytes, config.EnvLogLevel} {
 		t.Setenv(name, "")
 	}
 }
@@ -197,5 +198,37 @@ func TestAddr(t *testing.T) {
 			cfg := config.Config{Host: tc.host, Port: tc.port}
 			assert.Equal(t, tc.want, cfg.Addr())
 		})
+	}
+}
+
+// GASSAWAY_LOG_LEVEL is a tuning knob with a validated value: a service that
+// silently ignores the level it was told to use is harder to diagnose than one
+// that refuses to start.
+func TestLogLevelIsValidated(t *testing.T) {
+	clearLimitEnv(t)
+	t.Setenv(config.EnvLogLevel, "")
+	cfg, err := config.Parse(valid())
+	require.NoError(t, err)
+	assert.Equal(t, config.DefaultLogLevel, cfg.LogLevel, "info is the default")
+
+	for value, want := range map[string]slog.Level{
+		"debug":   slog.LevelDebug,
+		"info":    slog.LevelInfo,
+		"warning": slog.LevelWarn,
+		"warn":    slog.LevelWarn,
+		"ERROR":   slog.LevelError,
+	} {
+		t.Setenv(config.EnvLogLevel, value)
+		cfg, err := config.Parse(valid())
+		require.NoError(t, err, "value %q", value)
+		assert.Equal(t, want, cfg.LogLevel, "value %q", value)
+	}
+
+	for _, value := range []string{"trace", "verbose", "1", " "} {
+		t.Setenv(config.EnvLogLevel, value)
+		_, err := config.Parse(valid())
+		require.Error(t, err, "value %q must be refused", value)
+		assert.Contains(t, err.Error(), config.EnvLogLevel)
+		assert.Contains(t, err.Error(), value)
 	}
 }

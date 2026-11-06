@@ -14,11 +14,13 @@ surface is two URLs: `/project/<projectId>` for that project's memory over
 Streamable HTTP, and `/healthz` for the service status, its version and how many
 projects it stores.
 
-The tool surface follows the reference memory server: `create_entities`,
+The tool surface is the reference memory server's: `create_entities`,
 `create_relations`, `add_observations`, `delete_entities`, `delete_observations`,
 `delete_relations`, `read_graph`, `search_nodes`, `open_nodes`, plus the
-`memory://knowledge-graph` resource. The on-disk format is the same JSONL, so an
-existing `memory.jsonl` can be imported without conversion.
+`memory://knowledge-graph` resource. The tool names, titles, annotations and the
+argument and result schemas of all nine tools are pinned by a test against a
+committed capture of that server (see [Compatibility with the reference](#compatibility-with-the-reference)).
+The on-disk format is the same JSONL, so an existing `memory.jsonl` reads as it is.
 
 ## Build and run
 
@@ -112,10 +114,17 @@ The URL is the only place the identity lives:
 ```
 
 A path segment that is not exactly 64 lowercase hexadecimal characters is refused with
-`400` before the project is created. There is no header, query parameter or second
-segment that names a project, and no request falls back to a default one. Each hash
-directory contains `project.json` with `schemaVersion: 1` and `projectId`; invalid
-metadata is rejected when opening the store.
+`400` before any project state is touched. There is no header, query parameter or second
+segment that names a project, and no request falls back to a default one. A session is
+scoped to the project whose server minted it: its ID is `<projectId>.<random>`, and a
+request that presents it under another project's URL is refused with `404` before that
+project is opened.
+
+A project's storage appears when it first holds something. A request that only reads a
+project that does not exist yet returns an empty graph and leaves the data directory
+exactly as it was; the first write creates `<projectId>/` with `project.json`
+(`schemaVersion: 1`, `projectId`) and `memory.jsonl`. Invalid metadata is rejected when
+the project is opened, and never silently replaced.
 
 To name a project by hand, hash its resolved absolute path the way the contract does:
 
@@ -126,9 +135,15 @@ printf %s "$(realpath -- ~/dev/app)" | sha256sum | cut -d' ' -f1
 There is no listing endpoint. What the server stores is what the configured data
 directory holds, so `ls` and `du -sh` are the operator's view.
 
-Two clients with the same ID share a graph and their writes are serialized. Two
-processes on one data directory are not supported. There is no compatibility lookup,
-migration or adapter for the old basename stores; existing data is left untouched.
+Two clients with the same ID share a graph and their writes are serialized, including
+across a project runtime that the server has dropped and rebuilt (the write lock belongs
+to the graph path, not to the in-memory runtime). Two processes on one data directory are
+not supported. There is no compatibility lookup, migration or adapter for the old
+basename stores; existing data is left untouched.
+
+`GASSAWAY_MAX_PROJECTS` bounds how many project runtimes are held at once. The least
+recently used one is dropped when the bound is reached, and rebuilt from its file on the
+next request; a client session that holds a dropped runtime keeps working.
 
 ## Amanda configuration
 
@@ -169,17 +184,70 @@ see. Two limits keep environment variables, because they are tuning rather than 
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `GASSAWAY_MAX_PROJECTS` | `1024` | cap on projects open in one process (429 past it) |
+| `GASSAWAY_MAX_PROJECTS` | `1024` | bound on project runtimes held at once; the least recently used is evicted |
 | `GASSAWAY_MAX_BODY_BYTES` | `4194304` | request body cap (413 past it) |
+| `GASSAWAY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`; anything else refuses the start |
 
 Exit codes: `0` ran and stopped cleanly; `2` usage error — a missing or malformed option,
-in which case nothing is started and no directory is created; `1` a storage, bind or
-shutdown failure.
+in which case nothing is started and no directory is created; `1` a storage, bind or shutdown
+failure. A signal drains in-flight requests for up to five seconds, then closes the
+remaining connections and exits `0`: every acknowledged write is already on disk, so a
+client losing its stream does not lose data.
 
 `GET /healthz` on a running instance answers
 `{"status":"ok","version":"0.1.0","projects":N}`. That is the liveness check and the
 version query in one request: the binary has no probe mode of its own, so nothing is
 started and no directory is created to ask.
+
+## Logging
+
+The server logs to stderr, which the unit sends to the journal:
+
+```sh
+journalctl -u gassaway -f
+```
+
+At the default level a failed MCP call produces exactly one record naming the project,
+the tool, the reason and the duration; a successful call produces nothing. `debug` adds
+one record per successful call. HTTP refusals (bad identity, foreign session, unknown
+route) are logged with the method and status, and a storage failure is logged in full
+while the client is told only that storage is unavailable.
+
+What is never logged: tool arguments, entity names, and observation text. The error
+string a tool returned is logged, because it is the diagnostic the client already
+received and it stays on the host, in the same trust domain as the graph files.
+
+| Field | Meaning |
+| --- | --- |
+| `project` | the project ID (the SHA-256 hash in the URL) |
+| `tool` | the MCP tool name for `tools/call` records |
+| `error` | the error the client was given, or the panic value for a recovered panic |
+| `duration_ms` | wall time of the call |
+| `method`, `path`, `status`, `reason` | on HTTP-edge refusal records |
+
+## Compatibility with the reference
+
+`src/memory/testdata/reference-tools.json` is a committed capture of the reference
+memory server's `tools/list` and `resources/list`, with its provenance in
+`testdata/PROVENANCE.md`. A test compares this server's published contract against it
+structurally — names, titles, annotation hints, argument and result property names,
+types, `required` lists, and openness — and fails on any drift in either direction.
+
+Two consequences are worth knowing:
+
+- **Argument objects are open.** A payload with a field the server does not model is
+  accepted and ignored, and a payload missing a required field reports that field, which
+  is the actionable message a model can correct.
+- **Tool results follow the reference.** `delete_entities`, `delete_observations` and
+  `delete_relations` return `{success, message}`; the read tools accept the reference's
+  optional `entityTypes`, `limit` and `observationLimit` arguments, and report
+  `observationCount` only when an observation limit was given. `create_entities` adds a
+  second text item when it skipped an existing name, so a model cannot conclude that its
+  observations were stored.
+
+These shapes replace earlier, different ones (`{deleted, notFound}` and friends). No
+compatibility shim is provided: this is a single-consumer service and its consumer is
+updated with it.
 
 ## Storage
 
@@ -193,21 +261,50 @@ basename directories. Existing data remains untouched and unused.
 
 Backing memory up is copying the configured data directory, including project.json files.
 
+## Security posture
+
+The server is deployed on loopback, without authentication and without TLS. Anyone who
+can reach the port can read and write every project whose ID they know. The ID is a
+SHA-256 of a directory path, not a secret, so the protection is the bind address, not
+the hash.
+
+What is in place:
+
+- **DNS-rebinding protection** from the MCP SDK: a request that arrives on a loopback
+  connection with a non-loopback `Host` header is refused with `403`.
+- **No CORS headers are ever sent**, so a browser cannot issue the
+  `application/json` + `text/event-stream` POST that MCP requires: the preflight gets a
+  `405` with no `Access-Control-Allow-Origin`, and a "simple" cross-origin POST is
+  refused with `415`.
+- **Project-scoped sessions**, so a session ID from one project cannot be used against
+  another project's URL.
+- **No Origin validation.** This is deliberate: no browser client can reach the JSON
+  endpoint today, and a remote shared deployment will be fronted by a proxy that can
+  enforce its own Origin policy. Revisit this at the first browser client, the first
+  `Access-Control-Allow-Origin` header, or the move off loopback — then add an Origin
+  allowlist at the TLS-terminating proxy, or in-process with
+  `http.NewCrossOriginProtection`.
+
 ## What 0.1.0 does not do
 
-- **No authentication.** Keep it on loopback, or put an authenticating proxy in
-  front. Anyone who reaches the port can read every project.
+- **No authentication and no TLS yet.** Keep it on loopback. Both are planned for the
+  shared deployment; until then, anyone who reaches the port can read every project.
+- **No Origin validation** — see [Security posture](#security-posture) for why, and for
+  the conditions that require revisiting it.
 - **No stdio transport**, no separate HTTP+SSE transport, no resource
   subscriptions, and no 2026-07-28 protocol era (the server runs the SDK's
-  sessionful handler, which serves 2025-era clients — what Amanda speaks).
+  sessionful handler, which serves 2025-era clients — what Amanda speaks). A client that
+  opens with a newer version is answered with an `UnsupportedProtocolVersion` error
+  listing the versions the server does support, so it can renegotiate down.
 - **No multi-process sharing** of one data directory.
 - **No per-project access control**: isolation is organizational.
 
 ## License and provenance
 
 `gassaway` is an independent Go implementation, MIT licensed (see `LICENSE`). Its
-tool interface — names, the `memory://knowledge-graph` resource, the JSONL record
-format and the nine tools' behavior — follows the reference memory server in
+tool interface — names, titles, annotations, argument and result schemas, the
+`memory://knowledge-graph` resource, the JSONL record format and the nine tools'
+behavior — follows the reference memory server in
 [`modelcontextprotocol/servers`](https://github.com/modelcontextprotocol/servers),
 `src/memory`, which is MIT. No TypeScript source was translated; the implementation,
 tests, scripts and documentation here are original.

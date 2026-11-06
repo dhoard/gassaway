@@ -428,10 +428,12 @@ func TestProjectsAreIsolated(t *testing.T) {
 	betaGraph := callTool(t, openSession(t, srv.url, projectID(t, beta)), "read_graph", map[string]any{})
 	assert.Empty(t, betaGraph["entities"], "one project's writes must not reach another")
 
-	for _, id := range []string{projectID(t, alpha), projectID(t, beta)} {
-		_, err := os.Stat(filepath.Join(dataDir, id, "project.json"))
-		assert.NoError(t, err, "each visited project owns one directory")
-	}
+	// Storage appears for the project that was written, and only for that one: a
+	// read of the other leaves the data directory untouched.
+	_, err := os.Stat(filepath.Join(dataDir, projectID(t, alpha), "project.json"))
+	assert.NoError(t, err, "the written project owns one directory")
+	_, err = os.Stat(filepath.Join(dataDir, projectID(t, beta)))
+	assert.True(t, os.IsNotExist(err), "a project that was only read must not be created")
 }
 
 func TestGraphsSurviveRestart(t *testing.T) {
@@ -556,4 +558,64 @@ func newJSONRequest(t *testing.T, endpoint, body string, headers map[string]stri
 
 func httpClientDo(req *http.Request) (*http.Response, error) {
 	return (&http.Client{Timeout: 10 * time.Second}).Do(req)
+}
+
+// SIGTERM must stop the process cleanly even while a client holds the standalone
+// SSE stream that a URL-only client opens. Before this was fixed the graceful
+// wait expired, the process exited 1, and a supervisor reported every restart as
+// a failure. The graph is already durable, so the client losing its stream is the
+// only observable effect.
+func TestSigtermExitsCleanlyWithAConnectedClient(t *testing.T) {
+	srv := startServer(t, t.TempDir())
+	id := projectID(t, projectDirectory(t, "app"))
+
+	// The default transport keeps standalone SSE enabled, unlike openSession.
+	client := mcp.NewClient(&mcp.Implementation{Name: "e2e", Version: "0"}, nil)
+	cs, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
+		Endpoint: endpoint(srv.url, id),
+	}, nil)
+	require.NoError(t, err)
+	defer cs.Close()
+
+	createEntity(t, cs, "Ada", "durable")
+
+	srv.stop(t) // asserts the process exited with status 0
+}
+
+// A rejected call must be visible in the server's own log, naming the project and
+// the tool: that is the record an operator has when a harness reports a failure.
+func TestFailedCallIsVisibleInTheServersLog(t *testing.T) {
+	srv := startServer(t, t.TempDir())
+	id := projectID(t, projectDirectory(t, "app"))
+	cs := openSession(t, srv.url, id)
+
+	// The flattened single-observation payload an agent sends by mistake.
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "add_observations",
+		Arguments: map[string]any{"entityName": "Ada", "contents": []string{"lost"}},
+	})
+	require.NoError(t, err)
+	require.True(t, res.IsError)
+
+	srv.stop(t) // waits for the process, so every line has been written
+
+	logs := srv.logs.String()
+	assert.Contains(t, logs, "tool call failed")
+	assert.Contains(t, logs, "tool=add_observations")
+	assert.Contains(t, logs, "project="+id)
+	assert.Equal(t, 1, strings.Count(logs, "tool call failed"), "one record per failed call; log was:\n%s", logs)
+	assert.Contains(t, logs, "observations", "the record carries the reason the model was given")
+}
+
+// The log level is validated at start-up: a stale unit that says "verbose" fails
+// loudly instead of running at a level nobody asked for.
+func TestJunkLogLevelIsRefused(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "projects")
+	out, code := runServer(t, []string{"GASSAWAY_LOG_LEVEL=verbose"},
+		"--host", "127.0.0.1", "--port", "3999", "--project", dataDir)
+	assert.Equal(t, 2, code, "output:\n%s", out)
+	assert.Contains(t, out, "GASSAWAY_LOG_LEVEL")
+	assert.NotContains(t, out, "listening on")
+	_, err := os.Stat(dataDir)
+	assert.True(t, os.IsNotExist(err), "a refused start must not create the data directory")
 }
