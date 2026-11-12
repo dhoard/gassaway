@@ -15,12 +15,13 @@
 //   - Fields the model does not know (a createdAt written by another client)
 //     survive a save, because they are carried on the record in `extras`.
 //
-// A Store serializes its own read-modify-write cycles with a mutex; the server
-// keeps one Store per project, so two projects never contend.
+// A Store serializes its read-modify-write cycles with a lock keyed by the file's
+// path; the server keeps one Store per project, so two projects never contend.
 package graph
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -248,35 +249,80 @@ func cloneEntity(e Entity) Entity {
 	return c
 }
 
-func entityIndex(g *KnowledgeGraph, name string) int {
+// EntityNotFoundError reports an operation that named an entity the graph does
+// not hold. Its text is what the model reads and can act on, so it quotes the
+// name; Redacted is what an operator's log gets, which must not.
+type EntityNotFoundError struct {
+	Name string
+}
+
+func (e *EntityNotFoundError) Error() string {
+	return fmt.Sprintf("entity with name %s not found", e.Name)
+}
+
+// Redacted is the error without the entity name.
+func (e *EntityNotFoundError) Redacted() string { return "entity not found" }
+
+// InvalidRecordError reports an entity or relation that cannot be stored because
+// a field the stored format requires is empty. It names the position and the
+// field, never a value, so it is safe to log as it is.
+type InvalidRecordError struct {
+	Kind  string // "entity" or "relation"
+	Index int    // position in the call's array
+	Field string // the empty field, as the tool spells it
+}
+
+func (e *InvalidRecordError) Error() string {
+	return fmt.Sprintf("%s at index %d has an empty %s; nothing was written", e.Kind, e.Index, e.Field)
+}
+
+// entityNames is the set of entity names in g. The mutations build it once per
+// call instead of scanning the entity list for every item of a batch.
+func entityNames(g *KnowledgeGraph) map[string]bool {
+	names := make(map[string]bool, len(g.Entities))
 	for i := range g.Entities {
-		if g.Entities[i].Name == name {
-			return i
+		names[g.Entities[i].Name] = true
+	}
+	return names
+}
+
+// entityIndexes maps each entity name to its position in g. A name stored twice
+// (only a hand-edited file can hold one) resolves to its first record, as a
+// linear scan would.
+func entityIndexes(g *KnowledgeGraph) map[string]int {
+	index := make(map[string]int, len(g.Entities))
+	for i := range g.Entities {
+		if _, seen := index[g.Entities[i].Name]; !seen {
+			index[g.Entities[i].Name] = i
 		}
 	}
-	return -1
+	return index
 }
 
-func sameRelation(a, b Relation) bool {
-	return a.From == b.From && a.To == b.To && a.RelationType == b.RelationType
+// relationKey is a relation's identity: the three fields that make two relations
+// the same edge. Relation itself carries a map and so cannot be a map key.
+type relationKey struct {
+	from, to, relationType string
 }
 
-func containsRelation(list []Relation, want Relation) bool {
-	for _, existing := range list {
-		if sameRelation(existing, want) {
-			return true
-		}
+func keyOf(r Relation) relationKey {
+	return relationKey{from: r.From, to: r.To, relationType: r.RelationType}
+}
+
+func relationKeys(relations []Relation) map[relationKey]bool {
+	keys := make(map[relationKey]bool, len(relations))
+	for _, r := range relations {
+		keys[keyOf(r)] = true
 	}
-	return false
+	return keys
 }
 
-func containsString(list []string, want string) bool {
+func stringSet(list []string) map[string]bool {
+	set := make(map[string]bool, len(list))
 	for _, s := range list {
-		if s == want {
-			return true
-		}
+		set[s] = true
 	}
-	return false
+	return set
 }
 
 // matches reports whether an entity contains the already lowercased query in its

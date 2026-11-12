@@ -292,15 +292,15 @@ func TestTwoStoresOnOnePathSerialize(t *testing.T) {
 	assert.Len(t, g.Entities, len(stores)*each, "no write may be lost between two stores over one path")
 }
 
-// The prepare hook runs once, before the first save, and nothing exists on disk
-// until then: a read of a project that was never written leaves no directory.
-func TestPrepareRunsOnceBeforeTheFirstSave(t *testing.T) {
+// The prepare hook runs before every save and never before a read: a read of a
+// project that was never written leaves no directory.
+func TestPrepareRunsBeforeEverySaveAndNeverOnRead(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "project")
 	path := filepath.Join(dir, "memory.jsonl")
 	store := graph.NewStore(path)
-	created := 0
+	prepared := 0
 	store.SetPrepare(func() error {
-		created++
+		prepared++
 		return os.MkdirAll(dir, 0o755)
 	})
 
@@ -308,14 +308,36 @@ func TestPrepareRunsOnceBeforeTheFirstSave(t *testing.T) {
 	require.NoError(t, err)
 	_, statErr := os.Stat(dir)
 	assert.True(t, os.IsNotExist(statErr), "a read must not create the project directory")
+	assert.Zero(t, prepared, "a read must not run the prepare hook")
 
 	_, err = store.CreateEntities([]graph.Entity{{Name: "Ada", EntityType: "person"}})
 	require.NoError(t, err)
-	assert.Equal(t, 1, created, "the prepare hook runs before the first save")
+	assert.Equal(t, 1, prepared, "the prepare hook runs before the first save")
 
 	_, err = store.CreateEntities([]graph.Entity{{Name: "Grace", EntityType: "person"}})
 	require.NoError(t, err)
-	assert.Equal(t, 1, created, "the prepare hook runs only once")
+	assert.Equal(t, 2, prepared, "the prepare hook runs before every save")
+}
+
+// A directory removed while the store is in use is not a permanent failure: the
+// next save prepares it again and the project starts over as an empty one.
+func TestSaveRecreatesARemovedDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "project")
+	path := filepath.Join(dir, "memory.jsonl")
+	store := graph.NewStore(path)
+	store.SetPrepare(func() error { return os.MkdirAll(dir, 0o755) })
+
+	_, err := store.CreateEntities([]graph.Entity{{Name: "Ada", EntityType: "person"}})
+	require.NoError(t, err)
+	require.NoError(t, os.RemoveAll(dir))
+
+	_, err = store.CreateEntities([]graph.Entity{{Name: "Grace", EntityType: "person"}})
+	require.NoError(t, err, "a save after the directory was removed must succeed")
+
+	g, err := store.Read()
+	require.NoError(t, err)
+	require.Len(t, g.Entities, 1)
+	assert.Equal(t, "Grace", g.Entities[0].Name)
 }
 
 // A prepare failure is a failed save, and the previous graph is untouched.
@@ -333,4 +355,139 @@ func TestPrepareFailureFailsTheSave(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, g.Entities, 1)
 	assert.Equal(t, "Ada", g.Entities[0].Name)
+}
+
+// An entity the stored format cannot represent is refused, not acknowledged and
+// then lost: the whole call fails and the file is not touched.
+func TestCreateEntitiesRefusesEmptyNameOrType(t *testing.T) {
+	for _, tc := range []struct {
+		label  string
+		entity graph.Entity
+		field  string
+	}{
+		{"empty name", graph.Entity{Name: "", EntityType: "person"}, "name"},
+		{"empty type", graph.Entity{Name: "Grace", EntityType: ""}, "entityType"},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			store, path := newStore(t)
+			_, err := store.CreateEntities([]graph.Entity{
+				{Name: "Ada", EntityType: "person", Observations: []string{"kept out too"}},
+				tc.entity,
+			})
+			var invalid *graph.InvalidRecordError
+			require.ErrorAs(t, err, &invalid)
+			assert.Equal(t, 1, invalid.Index)
+			assert.Equal(t, tc.field, invalid.Field)
+
+			_, statErr := os.Stat(path)
+			assert.True(t, os.IsNotExist(statErr), "a refused call must write nothing")
+		})
+	}
+}
+
+// A relation with an empty field would be written and then read back as an
+// unreadable line, so it is refused the same way.
+func TestCreateRelationsRefusesEmptyFields(t *testing.T) {
+	store, _ := newStore(t)
+	_, err := store.CreateEntities([]graph.Entity{{Name: "Ada", EntityType: "person"}, {Name: "Grace", EntityType: "person"}})
+	require.NoError(t, err)
+
+	for _, r := range []graph.Relation{
+		{From: "", To: "Grace", RelationType: "knows"},
+		{From: "Ada", To: "", RelationType: "knows"},
+		{From: "Ada", To: "Grace", RelationType: ""},
+	} {
+		_, err := store.CreateRelations([]graph.Relation{r})
+		var invalid *graph.InvalidRecordError
+		require.ErrorAs(t, err, &invalid, "relation %+v", r)
+	}
+
+	g, err := store.Read()
+	require.NoError(t, err)
+	assert.Empty(t, g.Relations)
+}
+
+// A missing entity is a typed error whose redacted form does not carry the name.
+func TestEntityNotFoundErrorRedactsTheName(t *testing.T) {
+	store, _ := newStore(t)
+	_, err := store.AddObservations([]graph.ObservationAdd{{EntityName: "secret-name", Contents: []string{"x"}}})
+	var notFound *graph.EntityNotFoundError
+	require.ErrorAs(t, err, &notFound)
+	assert.Contains(t, err.Error(), "secret-name", "the caller is told which name was missing")
+	assert.NotContains(t, notFound.Redacted(), "secret-name")
+}
+
+// One call may name the same entity twice; the second item dedupes against what
+// the first one added.
+func TestAddObservationsDedupesAcrossItemsOfOneCall(t *testing.T) {
+	store, _ := newStore(t)
+	_, err := store.CreateEntities([]graph.Entity{{Name: "Ada", EntityType: "person", Observations: []string{"a"}}})
+	require.NoError(t, err)
+
+	results, err := store.AddObservations([]graph.ObservationAdd{
+		{EntityName: "Ada", Contents: []string{"a", "b", "b"}},
+		{EntityName: "Ada", Contents: []string{"b", "c"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"b"}, results[0].AddedObservations)
+	assert.Equal(t, []string{"c"}, results[1].AddedObservations)
+
+	g, err := store.Read()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b", "c"}, g.Entities[0].Observations)
+}
+
+// The write-lock table holds an entry only while a write is in flight, so the
+// number of projects a process has served does not accumulate in it.
+func TestWriteLocksAreReleasedAfterUse(t *testing.T) {
+	before := graph.HeldPathLocks()
+	root := t.TempDir()
+	for i := 0; i < 50; i++ {
+		store := graph.NewStore(filepath.Join(root, fmt.Sprint(i), "memory.jsonl"))
+		_, err := store.Read()
+		require.NoError(t, err)
+		_, err = store.CreateEntities([]graph.Entity{{Name: "Ada", EntityType: "person"}})
+		require.NoError(t, err)
+	}
+	assert.Equal(t, before, graph.HeldPathLocks(), "no lock entry may outlive its write")
+}
+
+// A batch far larger than any linear-scan implementation could finish in the
+// time allowed: the mutations index the graph once per call.
+func TestLargeBatchesDoNotScanPerItem(t *testing.T) {
+	const n = 20000
+	store, _ := newStore(t)
+	entities := make([]graph.Entity, n)
+	relations := make([]graph.Relation, n)
+	adds := make([]graph.ObservationAdd, n)
+	names := make([]string, n)
+	for i := range entities {
+		names[i] = fmt.Sprintf("e%d", i)
+		entities[i] = graph.Entity{Name: names[i], EntityType: "t"}
+		relations[i] = graph.Relation{From: names[i], To: fmt.Sprintf("e%d", (i+1)%n), RelationType: "next"}
+		adds[i] = graph.ObservationAdd{EntityName: names[i], Contents: []string{"o"}}
+	}
+
+	created, err := store.CreateEntities(entities)
+	require.NoError(t, err)
+	require.Len(t, created.Created, n)
+	rels, err := store.CreateRelations(relations)
+	require.NoError(t, err)
+	require.Len(t, rels, n)
+	again, err := store.CreateRelations(relations)
+	require.NoError(t, err)
+	assert.Empty(t, again, "a repeated batch adds nothing")
+	_, err = store.AddObservations(adds)
+	require.NoError(t, err)
+	deleted, err := store.DeleteRelations(relations)
+	require.NoError(t, err)
+	assert.Equal(t, n, deleted)
+	result, err := store.DeleteEntities(names)
+	require.NoError(t, err)
+	assert.Len(t, result.Deleted, n)
+
+	g, err := store.Read()
+	require.NoError(t, err)
+	assert.Empty(t, g.Entities)
+	assert.Empty(t, g.Relations)
 }

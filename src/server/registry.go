@@ -45,7 +45,7 @@ type Project struct {
 // Dropping a runtime is safe because a runtime holds no exclusive resource: the
 // graph's write lock belongs to the graph package and is keyed by path, so the
 // Store of a dropped project and the Store of its replacement exclude each other
-// (see graph.lockFor). Sessions that were connected to a dropped runtime keep
+// (see graph.Store). Sessions that were connected to a dropped runtime keep
 // working: they hold the old *mcp.Server, which reads and writes the same file
 // through the same lock.
 type Registry struct {
@@ -91,12 +91,8 @@ func (r *Registry) Get(id string) (*Project, error) {
 		return nil, err
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if element, ok := r.projects[id]; ok {
-		r.order.MoveToFront(element)
-		return element.Value.(*Project), nil
+	if p, ok := r.cached(id); ok {
+		return p, nil
 	}
 
 	graphPath, err := projects.GraphPath(r.root, id)
@@ -105,6 +101,13 @@ func (r *Registry) Get(id string) (*Project, error) {
 	}
 	dir := filepath.Dir(graphPath)
 
+	// The registry lock is not held here. It is the one lock every project's
+	// requests pass through, and this step reads the disk and can write and sync
+	// a metadata document: holding the lock across it would let one project's
+	// slow open stall every other project. Two requests opening the same project
+	// at once both run the check, which is idempotent, and the second to finish
+	// adopts the first one's runtime below.
+	//
 	// An existing project is validated when it is opened; a nonexistent one is
 	// not created. Any error other than "not there" is reported rather than read
 	// as "not there", so a project whose metadata cannot be checked does not
@@ -116,11 +119,29 @@ func (r *Registry) Get(id string) (*Project, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspecting project directory %s: %w", dir, err)
 	}
-
 	p := r.newProject(id, graphPath)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if element, ok := r.projects[id]; ok {
+		r.order.MoveToFront(element)
+		return element.Value.(*Project), nil
+	}
 	r.projects[id] = r.order.PushFront(p)
 	r.evictIfNeeded()
 	return p, nil
+}
+
+// cached returns the runtime already held for id, marking it most recently used.
+func (r *Registry) cached(id string) (*Project, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	element, ok := r.projects[id]
+	if !ok {
+		return nil, false
+	}
+	r.order.MoveToFront(element)
+	return element.Value.(*Project), true
 }
 
 // newProject builds one project's runtime. The store is given a prepare hook so
@@ -200,7 +221,8 @@ func validateMetadata(dir, id string) error {
 
 // ensureMetadata validates the project's metadata document and creates it when
 // the project has none, atomically. It is the store's prepare hook, so it runs
-// when the project is about to hold data for the first time.
+// before every save: the first one creates the project, and a later one brings
+// back a directory that was removed while the server was running.
 func ensureMetadata(dir, id string) error {
 	type metadata struct {
 		SchemaVersion int    `json:"schemaVersion"`

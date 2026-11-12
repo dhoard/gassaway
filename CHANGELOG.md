@@ -11,6 +11,32 @@ The tool surface is pinned to the reference memory server by
 
 ### Fixed
 
+- **Rejected arguments and entity names no longer reach the log.** The `error` field
+  carried the string the client was given, and a schema validator quotes the value it
+  rejected: a `create_entities` call that sent its array as a string put every name and
+  observation of the batch in the journal, against the documented guarantee. The field is
+  now a redacted reason — the schema location and the rule broken, or `entity not found` —
+  and the client's own error text is unchanged.
+- **An entity or relation with an empty field is refused instead of lost.**
+  `create_entities` accepted an empty `name` or `entityType`, reported the entity created,
+  and wrote a line that every later read set aside as unreadable. `create_entities` and
+  `create_relations` now fail the whole call, write nothing, and name the position and
+  the field.
+- **A project directory removed while the server runs no longer breaks that project.**
+  The store prepared its directory once, so every later write failed until the runtime was
+  evicted or the service restarted. The directory and its metadata are now prepared before
+  each save.
+- **Opening a project no longer holds the lock every project shares.** `Registry.Get`
+  read, and sometimes wrote and synced, the project's metadata while holding the registry
+  mutex, so one slow open stalled all projects. The disk work now happens outside it.
+- **The write-lock table no longer grows with every project ID ever requested.** An
+  entry exists only while a write is in flight; a request that names a project and never
+  writes to it leaves nothing behind.
+- **Sessions of clients that died are reclaimed.** A session with no request for
+  `GASSAWAY_SESSION_TIMEOUT` (default `24h`) is closed. Before, it was held until restart.
+- **A stalled request body is cut off.** Only the header read was bounded; a client could
+  send headers and hold the connection open on the body. The body must now arrive within
+  30 seconds, and the limit ends with the body so response streams are unaffected.
 - **A panic in a handler no longer kills the process.** The SDK runs handlers on its own
   goroutines, so `net/http`'s per-connection recovery did not apply and one request could
   take down every project. A receiving middleware now converts a panic into a JSON-RPC
@@ -43,6 +69,12 @@ The tool surface is pinned to the reference memory server by
   and pointing at `add_observations`.
 
 ### Changed
+
+- **Batch mutations index the graph once per call.** Each item of a batch used to scan
+  the entity or relation list; `create_relations` with 50,000 relations took 12 s under
+  the project's write lock. The mutations now build name and relation sets once.
+- **The unit sets resource ceilings**: `MemoryHigh=1G`, `MemoryMax=2G`, `TasksMax=1024`,
+  `LimitNOFILE=65536`.
 
 - **The wire contract is now the reference's, and is pinned by a test.** Argument and
   result schemas are authored artifacts transcribed from a committed capture

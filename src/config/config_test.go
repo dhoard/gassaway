@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,7 +28,7 @@ func valid() config.Options {
 // clearLimitEnv removes any limit the developer's shell may export.
 func clearLimitEnv(t *testing.T) {
 	t.Helper()
-	for _, name := range []string{config.EnvMaxProjects, config.EnvMaxBodyBytes, config.EnvLogLevel} {
+	for _, name := range []string{config.EnvMaxProjects, config.EnvMaxBodyBytes, config.EnvSessionTimeout, config.EnvLogLevel} {
 		t.Setenv(name, "")
 	}
 }
@@ -115,11 +116,21 @@ func TestLimitsComeFromEnvironment(t *testing.T) {
 	clearLimitEnv(t)
 	t.Setenv(config.EnvMaxProjects, "7")
 	t.Setenv(config.EnvMaxBodyBytes, "1024")
+	t.Setenv(config.EnvSessionTimeout, "90m")
 
 	cfg, err := config.Parse(valid())
 	require.NoError(t, err)
 	assert.Equal(t, 7, cfg.MaxProjects)
 	assert.Equal(t, int64(1024), cfg.MaxBodyBytes)
+	assert.Equal(t, 90*time.Minute, cfg.SessionTimeout)
+}
+
+func TestTimeoutsHaveDefaults(t *testing.T) {
+	clearLimitEnv(t)
+	cfg, err := config.Parse(valid())
+	require.NoError(t, err)
+	assert.Equal(t, config.DefaultSessionTimeout, cfg.SessionTimeout)
+	assert.Equal(t, config.DefaultBodyReadTimeout, cfg.BodyReadTimeout)
 }
 
 func TestInvalidLimitsAreRefused(t *testing.T) {
@@ -128,6 +139,10 @@ func TestInvalidLimitsAreRefused(t *testing.T) {
 		{config.EnvMaxProjects, "many"},
 		{config.EnvMaxBodyBytes, "0"},
 		{config.EnvMaxBodyBytes, "-5"},
+		{config.EnvSessionTimeout, "0"},
+		{config.EnvSessionTimeout, "-1h"},
+		{config.EnvSessionTimeout, "3600"},
+		{config.EnvSessionTimeout, "soon"},
 	} {
 		t.Run(tc.name+"="+tc.value, func(t *testing.T) {
 			clearLimitEnv(t)

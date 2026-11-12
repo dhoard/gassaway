@@ -9,8 +9,8 @@
 // a service that quietly invents an address or a directory is hard to find on a
 // host that runs more than one of them. Nothing else may supply them either, so
 // an environment variable cannot resurrect a default behind the operator's back.
-// The two limits are tuning knobs rather than deployment identity, and keep
-// their variables and defaults.
+// The limits are tuning knobs rather than deployment identity, and keep their
+// variables and defaults.
 //
 // Parsing is strict — a malformed port is an error naming the option, not a
 // silent fallback — because a server that ignores what it was told is harder to
@@ -25,20 +25,30 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Defaults for the settings a deployment does not normally restate.
 const (
 	DefaultMaxProjects  = 1024
 	DefaultMaxBodyBytes = 4 << 20
+	// DefaultSessionTimeout is how long a session may go without a request before
+	// the server closes it. It is long on purpose: a harness can sit through
+	// hours of work between two memory calls, and the limit exists to reclaim the
+	// sessions of clients that died without ending them, not to police live ones.
+	DefaultSessionTimeout = 24 * time.Hour
+	// DefaultBodyReadTimeout bounds how long a client may take to deliver a
+	// request body once its headers have arrived.
+	DefaultBodyReadTimeout = 30 * time.Second
 )
 
 // Variables the server reads for its limits. The three deployment settings have
 // no variable: they are flags only.
 const (
-	EnvMaxProjects  = "GASSAWAY_MAX_PROJECTS"
-	EnvMaxBodyBytes = "GASSAWAY_MAX_BODY_BYTES"
-	EnvLogLevel     = "GASSAWAY_LOG_LEVEL"
+	EnvMaxProjects    = "GASSAWAY_MAX_PROJECTS"
+	EnvMaxBodyBytes   = "GASSAWAY_MAX_BODY_BYTES"
+	EnvSessionTimeout = "GASSAWAY_SESSION_TIMEOUT"
+	EnvLogLevel       = "GASSAWAY_LOG_LEVEL"
 )
 
 // Accepted ports. 0 is refused even though the kernel would assign a free port:
@@ -79,6 +89,11 @@ type Config struct {
 	MaxProjects int
 	// MaxBodyBytes bounds a request body.
 	MaxBodyBytes int64
+	// SessionTimeout closes a session that has received no request for this
+	// long. Zero never closes an idle session.
+	SessionTimeout time.Duration
+	// BodyReadTimeout bounds the reading of one request body. Zero is no bound.
+	BodyReadTimeout time.Duration
 	// LogLevel is the minimum level the server logs at.
 	LogLevel slog.Level
 }
@@ -114,6 +129,9 @@ func Parse(opts Options) (Config, error) {
 		MaxProjects:  DefaultMaxProjects,
 		MaxBodyBytes: DefaultMaxBodyBytes,
 		LogLevel:     DefaultLogLevel,
+
+		SessionTimeout:  DefaultSessionTimeout,
+		BodyReadTimeout: DefaultBodyReadTimeout,
 	}
 
 	if v := os.Getenv(EnvMaxProjects); v != "" {
@@ -136,6 +154,13 @@ func Parse(opts Options) (Config, error) {
 			return Config{}, fmt.Errorf("%s must be a positive integer, got %q", EnvMaxBodyBytes, v)
 		}
 		cfg.MaxBodyBytes = n
+	}
+	if v := os.Getenv(EnvSessionTimeout); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return Config{}, fmt.Errorf("%s must be a positive duration such as 24h or 90m, got %q", EnvSessionTimeout, v)
+		}
+		cfg.SessionTimeout = d
 	}
 	return cfg, nil
 }

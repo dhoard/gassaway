@@ -29,79 +29,103 @@ import (
 	"syscall"
 )
 
-// Store is one project's graph file. Its mutex serializes every read-modify-write
-// cycle; reads alone do not take it, because the file is replaced atomically.
+// Store is one project's graph file. Every read-modify-write cycle is serialized
+// by a lock keyed by the file's path; reads alone do not take it, because the
+// file is replaced atomically.
 type Store struct {
 	path string
 
-	// mu is shared by every Store over the same path in this process (see
-	// lockFor). The server may drop and later recreate a project's runtime — for
-	// example when an LRU cache evicts it while a client session still holds the
-	// old one — and two Stores with independent mutexes would let two
+	// lockKey names this store's write lock in the process-wide table (see
+	// acquirePath). The server may drop and later recreate a project's runtime —
+	// for example when an LRU cache evicts it while a client session still holds
+	// the old one — and two Stores with independent mutexes would let two
 	// read-modify-write cycles interleave and lose an update. Keying the lock by
 	// path makes that impossible regardless of how many Store values exist.
-	mu *sync.Mutex
+	lockKey string
 
-	// prepare, when set, runs once before the first save. The owner of the file
-	// uses it to create the project directory and its metadata at the moment
-	// there is something to store, so a request that only reads a project leaves
-	// no trace on disk. It runs under mu.
-	prepare  func() error
-	prepared bool
+	// prepare, when set, runs before every save, under the write lock. The owner
+	// of the file uses it to create the project directory and its metadata at the
+	// moment there is something to store, so a request that only reads a project
+	// leaves no trace on disk. It must be idempotent: it runs again on each save,
+	// which is what brings back a directory an operator removed while the server
+	// was running.
+	prepare func() error
 }
 
 // NewStore returns a store over the JSONL file at path. Nothing is created here:
-// the directory is made by the first save, either directly or through the
-// prepare hook.
+// the directory is made by a save, either directly or through the prepare hook.
 func NewStore(path string) *Store {
-	return &Store{path: path, mu: lockFor(path)}
+	key := path
+	if abs, err := filepath.Abs(path); err == nil {
+		key = abs
+	}
+	return &Store{path: path, lockKey: key}
 }
 
-// SetPrepare registers fn to run once, before this store's first save. A nil fn
+// SetPrepare registers fn to run before each of this store's saves. A nil fn
 // restores the default behaviour of creating the directory with MkdirAll. It is
 // called by the owner of the project while the store is still private to it, so
 // it is not safe to call concurrently with a save.
 func (s *Store) SetPrepare(fn func() error) { s.prepare = fn }
 
-// pathLocks remembers one mutex per graph path for the lifetime of the process.
-// The table grows with the number of distinct paths this process has seen, which
-// is bounded by the number of distinct project IDs it has been asked about; each
-// entry is a path string and a pointer.
-var (
-	pathLocksMu sync.Mutex
-	pathLocks   = make(map[string]*sync.Mutex)
-)
-
-// lockFor returns the mutex shared by every Store over path.
-func lockFor(path string) *sync.Mutex {
-	key := path
-	if abs, err := filepath.Abs(path); err == nil {
-		key = abs
-	}
-	pathLocksMu.Lock()
-	defer pathLocksMu.Unlock()
-	mu, ok := pathLocks[key]
-	if !ok {
-		mu = new(sync.Mutex)
-		pathLocks[key] = mu
-	}
-	return mu
+// pathLock is one path's write lock and the number of goroutines that hold or
+// wait for it.
+type pathLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
-// ensureDir makes the graph's directory exist, running the prepare hook at most
-// once. It is called with mu held.
+// pathLocks holds a lock only for paths with a write in flight. An entry is
+// created by the first writer to arrive and removed when the last one leaves, so
+// the table is bounded by the number of concurrent writes and not by the number
+// of project IDs the process has ever been asked about: a request that names a
+// project and never writes to it leaves nothing behind.
+var (
+	pathLocksMu sync.Mutex
+	pathLocks   = make(map[string]*pathLock)
+)
+
+// acquirePath takes the write lock for key and returns the function that
+// releases it. Every writer over one path shares one entry for as long as any of
+// them holds or waits for it, which is what makes two Stores over the same file
+// exclude each other.
+func acquirePath(key string) (release func()) {
+	pathLocksMu.Lock()
+	l, ok := pathLocks[key]
+	if !ok {
+		l = new(pathLock)
+		pathLocks[key] = l
+	}
+	l.refs++
+	pathLocksMu.Unlock()
+
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		pathLocksMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(pathLocks, key)
+		}
+		pathLocksMu.Unlock()
+	}
+}
+
+// heldPathLocks reports how many paths currently have a lock entry. It exists
+// for the test that guards the table against growing without bound.
+func heldPathLocks() int {
+	pathLocksMu.Lock()
+	defer pathLocksMu.Unlock()
+	return len(pathLocks)
+}
+
+// ensureDir makes the graph's directory exist, through the prepare hook when one
+// is set. It is called with the write lock held, before every save.
 func (s *Store) ensureDir() error {
 	if s.prepare == nil {
 		return os.MkdirAll(filepath.Dir(s.path), 0o755)
 	}
-	if s.prepared {
-		return nil
-	}
-	if err := s.prepare(); err != nil {
-		return err
-	}
-	s.prepared = true
-	return nil
+	return s.prepare()
 }
 
 // snapshot is one reading of the file: the graph it holds and the lines the model
@@ -158,14 +182,14 @@ func (s *Store) save(l snapshot) error {
 	for _, e := range l.graph.Entities {
 		b, err := encodeEntity(e)
 		if err != nil {
-			return fmt.Errorf("encoding entity %q: %w", e.Name, err)
+			return fmt.Errorf("encoding entity: %w", err)
 		}
 		lines = append(lines, string(b))
 	}
 	for _, r := range l.graph.Relations {
 		b, err := encodeRelation(r)
 		if err != nil {
-			return fmt.Errorf("encoding relation %q->%q: %w", r.From, r.To, err)
+			return fmt.Errorf("encoding relation: %w", err)
 		}
 		lines = append(lines, string(b))
 	}
@@ -257,11 +281,10 @@ func syncDir(dir string) error {
 }
 
 // Mutate runs fn over a freshly loaded graph and saves the result, holding the
-// store's mutex across the whole cycle so concurrent callers cannot lose each
+// path's write lock across the whole cycle so concurrent callers cannot lose each
 // other's writes. An error from fn leaves the file untouched.
 func (s *Store) Mutate(fn func(*KnowledgeGraph) error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer acquirePath(s.lockKey)()
 
 	l, err := s.load()
 	if err != nil {
@@ -310,21 +333,28 @@ func (s *Store) ReadGraph(opts ReadOptions) (ReadGraph, error) {
 
 // CreateEntities adds entities whose names are new, skipping names that already
 // exist and names repeated earlier in the same call. Skipped entities keep none
-// of their observations, which is why the result reports them.
+// of their observations, which is why the result reports them. An entity without
+// a name or a type fails the whole call and nothing is written: the stored format
+// cannot represent one, so it would be acknowledged and then never read back.
 func (s *Store) CreateEntities(entities []Entity) (CreateResult, error) {
+	for i, e := range entities {
+		if e.Name == "" {
+			return CreateResult{}, &InvalidRecordError{Kind: "entity", Index: i, Field: "name"}
+		}
+		if e.EntityType == "" {
+			return CreateResult{}, &InvalidRecordError{Kind: "entity", Index: i, Field: "entityType"}
+		}
+	}
 	result := CreateResult{Created: []Entity{}, Skipped: []string{}}
 	err := s.Mutate(func(g *KnowledgeGraph) error {
-		seen := make(map[string]bool, len(entities))
+		taken := entityNames(g)
 		for _, e := range entities {
-			if seen[e.Name] || entityIndex(g, e.Name) >= 0 {
+			if taken[e.Name] {
 				result.Skipped = append(result.Skipped, e.Name)
 				continue
 			}
-			seen[e.Name] = true
+			taken[e.Name] = true
 			created := cloneEntity(e)
-			if created.Observations == nil {
-				created.Observations = []string{}
-			}
 			g.Entities = append(g.Entities, created)
 			result.Created = append(result.Created, cloneEntity(created))
 		}
@@ -337,24 +367,39 @@ func (s *Store) CreateEntities(entities []Entity) (CreateResult, error) {
 }
 
 // CreateRelations adds relations that are not already present. Every endpoint
-// must exist, and the whole call fails if one does not.
+// must exist and every relation must name its type, and the whole call fails if
+// one does not.
 func (s *Store) CreateRelations(relations []Relation) ([]Relation, error) {
+	for i, r := range relations {
+		switch {
+		case r.From == "":
+			return nil, &InvalidRecordError{Kind: "relation", Index: i, Field: "from"}
+		case r.To == "":
+			return nil, &InvalidRecordError{Kind: "relation", Index: i, Field: "to"}
+		case r.RelationType == "":
+			return nil, &InvalidRecordError{Kind: "relation", Index: i, Field: "relationType"}
+		}
+	}
 	created := []Relation{}
 	err := s.Mutate(func(g *KnowledgeGraph) error {
+		names := entityNames(g)
 		for _, r := range relations {
-			if entityIndex(g, r.From) < 0 {
-				return fmt.Errorf("entity with name %s not found", r.From)
+			if !names[r.From] {
+				return &EntityNotFoundError{Name: r.From}
 			}
-			if entityIndex(g, r.To) < 0 {
-				return fmt.Errorf("entity with name %s not found", r.To)
+			if !names[r.To] {
+				return &EntityNotFoundError{Name: r.To}
 			}
 		}
+		// The set starts as the stored relations and takes each one added here, so
+		// one lookup dedupes against both the stored graph and this batch.
+		present := relationKeys(g.Relations)
 		for _, r := range relations {
-			// g.Relations already holds the relations added earlier in this call, so
-			// one scan dedupes against both the stored graph and this batch.
-			if containsRelation(g.Relations, r) {
+			k := keyOf(r)
+			if present[k] {
 				continue
 			}
+			present[k] = true
 			g.Relations = append(g.Relations, r)
 			created = append(created, r)
 		}
@@ -371,16 +416,26 @@ func (s *Store) CreateRelations(relations []Relation) ([]Relation, error) {
 func (s *Store) AddObservations(adds []ObservationAdd) ([]ObservationAddResult, error) {
 	results := make([]ObservationAddResult, 0, len(adds))
 	err := s.Mutate(func(g *KnowledgeGraph) error {
+		index := entityIndexes(g)
+		// One set per entity touched, built on first use and kept for the rest of
+		// the call, so an entity named twice still dedupes across both items.
+		held := make(map[int]map[string]bool)
 		for _, add := range adds {
-			i := entityIndex(g, add.EntityName)
-			if i < 0 {
-				return fmt.Errorf("entity with name %s not found", add.EntityName)
+			i, ok := index[add.EntityName]
+			if !ok {
+				return &EntityNotFoundError{Name: add.EntityName}
+			}
+			have := held[i]
+			if have == nil {
+				have = stringSet(g.Entities[i].Observations)
+				held[i] = have
 			}
 			added := []string{}
 			for _, content := range add.Contents {
-				if containsString(g.Entities[i].Observations, content) || containsString(added, content) {
+				if have[content] {
 					continue
 				}
+				have[content] = true
 				g.Entities[i].Observations = append(g.Entities[i].Observations, content)
 				added = append(added, content)
 			}
@@ -401,12 +456,10 @@ func (s *Store) AddObservations(adds []ObservationAdd) ([]ObservationAddResult, 
 func (s *Store) DeleteEntities(names []string) (DeleteEntitiesResult, error) {
 	result := DeleteEntitiesResult{Deleted: []string{}, NotFound: []string{}}
 	err := s.Mutate(func(g *KnowledgeGraph) error {
-		want := make(map[string]bool, len(names))
+		want := stringSet(names)
+		present := entityNames(g)
 		for _, n := range names {
-			want[n] = true
-		}
-		for _, n := range names {
-			if entityIndex(g, n) >= 0 {
+			if present[n] {
 				result.Deleted = append(result.Deleted, n)
 			} else {
 				result.NotFound = append(result.NotFound, n)
@@ -438,15 +491,17 @@ func (s *Store) DeleteEntities(names []string) (DeleteEntitiesResult, error) {
 func (s *Store) DeleteObservations(deletes []ObservationDelete) (DeleteObservationsResult, error) {
 	result := DeleteObservationsResult{MissingEntities: []string{}}
 	err := s.Mutate(func(g *KnowledgeGraph) error {
+		index := entityIndexes(g)
 		for _, d := range deletes {
-			i := entityIndex(g, d.EntityName)
-			if i < 0 {
+			i, ok := index[d.EntityName]
+			if !ok {
 				result.MissingEntities = append(result.MissingEntities, d.EntityName)
 				continue
 			}
+			remove := stringSet(d.Observations)
 			kept := make([]string, 0, len(g.Entities[i].Observations))
 			for _, o := range g.Entities[i].Observations {
-				if containsString(d.Observations, o) {
+				if remove[o] {
 					result.DeletedCount++
 					continue
 				}
@@ -466,16 +521,10 @@ func (s *Store) DeleteObservations(deletes []ObservationDelete) (DeleteObservati
 func (s *Store) DeleteRelations(relations []Relation) (int, error) {
 	deleted := 0
 	err := s.Mutate(func(g *KnowledgeGraph) error {
+		remove := relationKeys(relations)
 		kept := make([]Relation, 0, len(g.Relations))
 		for _, r := range g.Relations {
-			remove := false
-			for _, d := range relations {
-				if sameRelation(r, d) {
-					remove = true
-					break
-				}
-			}
-			if remove {
+			if remove[keyOf(r)] {
 				deleted++
 				continue
 			}

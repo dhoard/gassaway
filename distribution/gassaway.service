@@ -30,6 +30,17 @@ StateDirectory=gassaway
 StateDirectoryMode=0750
 UMask=0027
 
+# Resource ceilings. One process serves every project, so a runaway — a client
+# that floods it, a graph far larger than expected — is contained here rather than
+# left to take memory, threads or descriptors from the rest of the host.
+# MemoryHigh throttles and reclaims first; MemoryMax is the hard stop, after
+# which Restart=on-failure brings the service back with every acknowledged write
+# on disk. The values are several times what the service uses in normal operation.
+MemoryHigh=1G
+MemoryMax=2G
+TasksMax=1024
+LimitNOFILE=65536
+
 # Confinement. The server receives project IDs, never client directories, so it
 # needs no access to home directories and no writable path beyond its state.
 NoNewPrivileges=yes

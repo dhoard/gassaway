@@ -17,10 +17,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -65,11 +67,18 @@ func New(cfg config.Config, log *slog.Logger) *Server {
 		return p.Server
 	}, &mcp.StreamableHTTPOptions{
 		MaxRequestBodyBytes: cfg.MaxBodyBytes,
+		// A client that dies without sending DELETE leaves its session behind,
+		// and the SDK keeps a session until it is ended. The idle limit is what
+		// reclaims those; a live client whose session lapsed is answered 404 and
+		// initializes again, as the protocol specifies.
+		SessionTimeout: cfg.SessionTimeout,
 	})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
-	mux.Handle(ProjectPath, s.withProject(streamable))
+	// The body deadline is outermost so that it also bounds a request that is
+	// refused before its body is read.
+	mux.Handle(ProjectPath, s.withBodyDeadline(s.withProject(streamable)))
 	mux.HandleFunc("/", s.handleNotFound)
 
 	s.handler = mux
@@ -80,6 +89,8 @@ func New(cfg config.Config, log *slog.Logger) *Server {
 		// WriteTimeout is deliberately unset: a Streamable HTTP response may be a
 		// long-lived SSE stream that a write deadline would cut. IdleTimeout bounds
 		// the keep-alive connections that are not carrying a stream instead.
+		// ReadTimeout is unset for the same reason — it would still be armed while
+		// a stream is open — and withBodyDeadline bounds the body read instead.
 		IdleTimeout: 120 * time.Second,
 	}
 	return s
@@ -146,6 +157,54 @@ func (s *Server) withProject(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), contextKey{}, p)))
 	})
+}
+
+// withBodyDeadline bounds how long a client may take to deliver a request body.
+//
+// ReadHeaderTimeout stops at the headers, so without this a client could send
+// them, promise a body, and hold the connection and its handler goroutine open
+// for as long as it liked. The deadline is set on the connection when the
+// request arrives and lifted the moment the body has been read to its end, so it
+// never outlives the body: the response that follows may be a stream that stays
+// open for hours.
+//
+// It is deliberately not lifted when the body was not read to its end — the read
+// failed, or the request was refused unread. net/http drains what is left of a
+// body before it answers, and that drain must stay bounded too; lifting the
+// deadline there would move the stall from the handler into the server. The
+// server sets the connection's deadline afresh before the next request.
+func (s *Server) withBodyDeadline(next http.Handler) http.Handler {
+	timeout := s.cfg.BodyReadTimeout
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if timeout <= 0 || r.Body == nil || r.Body == http.NoBody {
+			next.ServeHTTP(w, r)
+			return
+		}
+		rc := http.NewResponseController(w)
+		if err := rc.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			// A connection that cannot take a deadline is served without one.
+			next.ServeHTTP(w, r)
+			return
+		}
+		r.Body = &deadlineBody{ReadCloser: r.Body, lift: func() { _ = rc.SetReadDeadline(time.Time{}) }}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// deadlineBody is a request body that lifts the connection's read deadline once
+// it has been read to the end.
+type deadlineBody struct {
+	io.ReadCloser
+	lift func()
+	once sync.Once
+}
+
+func (b *deadlineBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		b.once.Do(b.lift)
+	}
+	return n, err
 }
 
 // sessionBelongsTo reports whether sessionID was minted by the server of project

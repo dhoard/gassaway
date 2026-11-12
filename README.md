@@ -86,7 +86,8 @@ same `--bin-dir` at uninstall that was used at install.
 `/var/lib/gassaway` is created by systemd through `StateDirectory=` and is readable only
 by `gassaway`: `0750` directories, `0600` files. The unit binds loopback only, runs
 sandboxed (`ProtectSystem=strict`, `ProtectHome=yes`, `IPAddressAllow=localhost`,
-`SystemCallFilter=@system-service`), and logs to the journal:
+`SystemCallFilter=@system-service`), under resource ceilings (`MemoryHigh=1G`,
+`MemoryMax=2G`, `TasksMax=1024`, `LimitNOFILE=65536`), and logs to the journal:
 
 ```sh
 journalctl -u gassaway -f
@@ -124,7 +125,11 @@ A project's storage appears when it first holds something. A request that only r
 project that does not exist yet returns an empty graph and leaves the data directory
 exactly as it was; the first write creates `<projectId>/` with `project.json`
 (`schemaVersion: 1`, `projectId`) and `memory.jsonl`. Invalid metadata is rejected when
-the project is opened, and never silently replaced.
+the project is opened and again before each write, and never silently replaced.
+
+Removing a project's directory while the server is running deletes that project and
+nothing else: its next write creates the directory and `project.json` again and the
+project starts over empty. No restart is needed.
 
 To name a project by hand, hash its resolved absolute path the way the contract does:
 
@@ -137,7 +142,8 @@ directory holds, so `ls` and `du -sh` are the operator's view.
 
 Two clients with the same ID share a graph and their writes are serialized, including
 across a project runtime that the server has dropped and rebuilt (the write lock belongs
-to the graph path, not to the in-memory runtime). Two processes on one data directory are
+to the graph path, not to the in-memory runtime, and exists only while a write is in
+flight). Two processes on one data directory are
 not supported. There is no compatibility lookup, migration or adapter for the old
 basename stores; existing data is left untouched.
 
@@ -180,12 +186,13 @@ The server's address and storage are command-line options, never a default:
 
 Nothing else supplies them: `GASSAWAY_BIND`, `GASSAWAY_PORT` and `GASSAWAY_PROJECTS_DIR`
 were retired, so a stale unit fails loudly instead of starting on an address nobody can
-see. Two limits keep environment variables, because they are tuning rather than identity:
+see. The limits keep environment variables, because they are tuning rather than identity:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `GASSAWAY_MAX_PROJECTS` | `1024` | bound on project runtimes held at once; the least recently used is evicted |
 | `GASSAWAY_MAX_BODY_BYTES` | `4194304` | request body cap (413 past it) |
+| `GASSAWAY_SESSION_TIMEOUT` | `24h` | a session with no request for this long is closed; a Go duration such as `90m` or `24h` |
 | `GASSAWAY_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`; anything else refuses the start |
 
 Exit codes: `0` ran and stopped cleanly; `2` usage error — a missing or malformed option,
@@ -193,6 +200,16 @@ in which case nothing is started and no directory is created; `1` a storage, bin
 failure. A signal drains in-flight requests for up to five seconds, then closes the
 remaining connections and exits `0`: every acknowledged write is already on disk, so a
 client losing its stream does not lose data.
+
+A session normally ends when its client sends `DELETE`. A client that dies without doing
+so would otherwise leave its session in memory until the next restart, so a session that
+has received no request for `GASSAWAY_SESSION_TIMEOUT` is closed. An open event stream
+does not count as a request. A client that returns after its session lapsed is answered
+`404` and initializes a new one, as the protocol specifies; the default is long so that a
+harness can sit through hours of work between two memory calls.
+
+A request body must arrive within 30 seconds of its headers. A client that stalls is cut
+off; the limit ends with the body, so it does not apply to the response stream.
 
 `GET /healthz` on a running instance answers
 `{"status":"ok","version":"0.1.0","projects":N}`. That is the liveness check and the
@@ -213,15 +230,19 @@ one record per successful call. HTTP refusals (bad identity, foreign session, un
 route) are logged with the method and status, and a storage failure is logged in full
 while the client is told only that storage is unavailable.
 
-What is never logged: tool arguments, entity names, and observation text. The error
-string a tool returned is logged, because it is the diagnostic the client already
-received and it stays on the host, in the same trust domain as the graph files.
+What is never logged: tool arguments, entity names, and observation text. The error a
+client was given can quote all three, so the `error` field is a redacted reason and not
+that string. Arguments the schema rejected are recorded as where they failed and which
+rule they broke — `invalid arguments at /properties/entities: type: has type "string",
+want "array"` — without the rejected value. A missing entity is recorded as
+`entity not found`, without its name. A storage failure is the server's own wording about
+its own state and is recorded in full.
 
 | Field | Meaning |
 | --- | --- |
 | `project` | the project ID (the SHA-256 hash in the URL) |
 | `tool` | the MCP tool name for `tools/call` records |
-| `error` | the error the client was given, or the panic value for a recovered panic |
+| `error` | the redacted reason a call failed, or the panic value for a recovered panic |
 | `duration_ms` | wall time of the call |
 | `method`, `path`, `status`, `reason` | on HTTP-edge refusal records |
 
@@ -244,6 +265,12 @@ Two consequences are worth knowing:
   `observationCount` only when an observation limit was given. `create_entities` adds a
   second text item when it skipped an existing name, so a model cannot conclude that its
   observations were stored.
+
+- **Empty names are refused.** The reference accepts an entity whose `name` or
+  `entityType` is empty, or a relation with an empty `from`, `to` or `relationType`. The
+  stored format cannot represent one — it reads back as a line no tool returns — so
+  `create_entities` and `create_relations` fail the whole call, write nothing, and name
+  the position and the field. The published schemas are unchanged.
 
 These shapes replace earlier, different ones (`{deleted, notFound}` and friends). No
 compatibility shim is provided: this is a single-consumer service and its consumer is
